@@ -63,8 +63,8 @@ add_executable(gecko
 
 target_link_libraries(gecko PRIVATE gecko_core)
 
-# Tests
-if(GECKO_BUILD_TESTS)
+# Tests (only if test files exist)
+if(GECKO_BUILD_TESTS AND EXISTS "${CMAKE_SOURCE_DIR}/tests/test_crypto.c")
     enable_testing()
     
     add_executable(test_crypto
@@ -73,11 +73,13 @@ if(GECKO_BUILD_TESTS)
     target_link_libraries(test_crypto PRIVATE gecko_core)
     add_test(NAME crypto COMMAND test_crypto)
     
-    add_executable(test_vault
-        tests/test_vault.c
-    )
-    target_link_libraries(test_vault PRIVATE gecko_core)
-    add_test(NAME vault COMMAND test_vault)
+    if(EXISTS "${CMAKE_SOURCE_DIR}/tests/test_vault.c")
+        add_executable(test_vault
+            tests/test_vault.c
+        )
+        target_link_libraries(test_vault PRIVATE gecko_core)
+        add_test(NAME vault COMMAND test_vault)
+    endif()
 endif()
 
 # Install

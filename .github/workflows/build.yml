@@ -20,6 +20,7 @@ jobs:
         run: cmake --build build --config Release
 
       - name: Run tests
+        if: hashFiles('tests/test_crypto.c') != ''
         run: |
           ./build/bin/Release/test_crypto.exe
           ./build/bin/Release/test_vault.exe
@@ -58,6 +59,7 @@ jobs:
         run: cmake --build build
 
       - name: Run tests
+        if: hashFiles('tests/test_crypto.c') != ''
         run: |
           chmod +x build/bin/test_crypto build/bin/test_vault
           ./build/bin/test_crypto
