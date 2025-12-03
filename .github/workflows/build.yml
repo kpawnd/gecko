@@ -1,0 +1,118 @@
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Run tests
+        run: |
+          ./build/bin/Release/test_crypto.exe
+          ./build/bin/Release/test_vault.exe
+
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc installer\gecko.iss
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: gecko-windows-installer
+          path: installer/output/gecko-*-setup-x64.exe
+
+      - name: Upload portable
+        uses: actions/upload-artifact@v4
+        with:
+          name: gecko-windows-portable
+          path: build/bin/Release/gecko.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure CMake
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Run tests
+        run: |
+          chmod +x build/bin/test_crypto build/bin/test_vault
+          ./build/bin/test_crypto
+          ./build/bin/test_vault
+
+      - name: Create tarball
+        run: |
+          mkdir -p dist
+          cp build/bin/gecko dist/
+          cp README.md LICENSE dist/
+          tar -czvf gecko-linux-x64.tar.gz -C dist .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gecko-linux
+          path: gecko-linux-x64.tar.gz
+
+  release:
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: gecko-windows-installer
+          path: dist
+
+      - name: Download Windows portable
+        uses: actions/download-artifact@v4
+        with:
+          name: gecko-windows-portable
+          path: portable
+
+      - name: Download Linux build
+        uses: actions/download-artifact@v4
+        with:
+          name: gecko-linux
+          path: dist
+
+      - name: Create portable zip
+        run: |
+          cd portable
+          zip ../dist/gecko-windows-portable-x64.zip gecko.exe
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/gecko-*-setup-x64.exe
+            dist/gecko-windows-portable-x64.zip
+            dist/gecko-linux-x64.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false
