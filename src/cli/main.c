@@ -1,7 +1,3 @@
-/*
- * Gecko CLI - Extended command interface
- */
-
 #include "gecko.h"
 #include "gecko/vault.h"
 #include "gecko/usb.h"
@@ -10,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef GECKO_WINDOWS
 #include <windows.h>
@@ -18,6 +15,7 @@
 #else
 #include <termios.h>
 #include <unistd.h>
+#include <signal.h>
 #endif
 
 #define MAX_PW 256
@@ -25,6 +23,14 @@
 #define MAX_FILE_SIZE (1ULL << 34)
 #define EMERGENCY_PREFIX "WIPE:"
 #define EMERGENCY_PREFIX_LEN 5
+#define INPUT_TIMEOUT_SEC 300
+#define MAX_ARGS 64
+
+/* Global for signal handling on Unix */
+#ifndef GECKO_WINDOWS
+static volatile sig_atomic_t g_interrupted = 0;
+static void sigint_handler(int sig) { (void)sig; g_interrupted = 1; }
+#endif
 
 static bool check_emergency_prefix(const char *pw) {
     if (!pw) return false;
@@ -44,10 +50,18 @@ static int read_pw(const char *prompt, char *pw, size_t max) {
 #ifdef GECKO_WINDOWS
     size_t i = 0;
     int c;
+    DWORD start_time = GetTickCount();
     while (i < max - 1) {
+        /* Check timeout */
+        if ((GetTickCount() - start_time) > (DWORD)(INPUT_TIMEOUT_SEC * 1000)) {
+            gecko_secure_zero(pw, max);
+            fprintf(stderr, "\nTimeout\n");
+            return -1;
+        }
+        if (!_kbhit()) { Sleep(50); continue; }
         c = getch();
         if (c == '\r' || c == '\n') break;
-        if (c == 3) { memset(pw, 0, max); return -1; }
+        if (c == 3 || c == 27) { gecko_secure_zero(pw, max); putchar('\n'); return -1; } /* Ctrl+C or ESC */
         if ((c == '\b' || c == 127) && i > 0) { pw[--i] = '\0'; printf("\b \b"); fflush(stdout); }
         else if (c >= 32 && c < 127) { pw[i++] = (char)c; putchar('*'); fflush(stdout); }
     }
@@ -57,17 +71,49 @@ static int read_pw(const char *prompt, char *pw, size_t max) {
     struct termios old, new_term;
     if (tcgetattr(STDIN_FILENO, &old) != 0) return -1;
     new_term = old;
-    new_term.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL);
+    new_term.c_lflag &= ~(ECHO | ECHOE | ECHOK | ECHONL | ICANON);
+    new_term.c_cc[VMIN] = 0;
+    new_term.c_cc[VTIME] = 1;  /* 100ms timeout for read */
     if (tcsetattr(STDIN_FILENO, TCSANOW, &new_term) != 0) return -1;
-    if (!fgets(pw, (int)(max - 1), stdin)) {
-        tcsetattr(STDIN_FILENO, TCSANOW, &old);
-        memset(pw, 0, max);
+    
+    /* Setup signal handler */
+    struct sigaction sa, old_sa;
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, &old_sa);
+    g_interrupted = 0;
+    
+    size_t i = 0;
+    time_t start_time = time(NULL);
+    char c;
+    while (i < max - 1 && !g_interrupted) {
+        /* Check timeout */
+        if ((time(NULL) - start_time) > INPUT_TIMEOUT_SEC) {
+            tcsetattr(STDIN_FILENO, TCSANOW, &old);
+            sigaction(SIGINT, &old_sa, NULL);
+            gecko_secure_zero(pw, max);
+            fprintf(stderr, "\nTimeout\n");
+            return -1;
+        }
+        ssize_t n = read(STDIN_FILENO, &c, 1);
+        if (n <= 0) continue;  /* No input yet */
+        if (c == '\n' || c == '\r') break;
+        if (c == 3 || c == 27) { g_interrupted = 1; break; } /* Ctrl+C or ESC */
+        if ((c == 127 || c == '\b') && i > 0) { pw[--i] = '\0'; printf("\b \b"); fflush(stdout); }
+        else if (c >= 32 && c < 127) { pw[i++] = (char)c; putchar('*'); fflush(stdout); }
+    }
+    pw[i] = '\0';
+    putchar('\n');
+    
+    tcsetattr(STDIN_FILENO, TCSANOW, &old);
+    sigaction(SIGINT, &old_sa, NULL);
+    
+    if (g_interrupted) {
+        g_interrupted = 0;
+        gecko_secure_zero(pw, max);
         return -1;
     }
-    tcsetattr(STDIN_FILENO, TCSANOW, &old);
-    putchar('\n');
-    size_t len = strlen(pw);
-    while (len > 0 && (pw[len-1] == '\n' || pw[len-1] == '\r')) pw[--len] = '\0';
 #endif
     return 0;
 }
@@ -114,13 +160,22 @@ static void usage(void) {
     printf("Usage: gecko <cmd> [args]\n\n");
     printf("Vault:\n");
     printf("  create <vault>              Create new vault\n");
+    printf("  create <vault> -k <keyfile> Create vault with keyfile (2FA)\n");
     printf("  add <vault> <file> [name]   Add file to vault\n");
     printf("  get <vault> <name> [dest]   Extract file from vault\n");
     printf("  ls <vault>                  List vault contents\n");
     printf("  rm <vault> <name>           Remove file from vault\n");
+    printf("  cat <vault> <name>          Print file contents to stdout\n");
     printf("  info <vault>                Show vault info\n");
     printf("  passwd <vault>              Change vault password\n");
     printf("  verify <vault>              Verify vault integrity\n\n");
+    printf("Bulk Operations:\n");
+    printf("  search <vault> <pattern>    Search files (supports * and ?)\n");
+    printf("  import <vault> <dir> [pfx]  Import directory recursively\n");
+    printf("  export <vault> <dir>        Export all files to directory\n");
+    printf("  backup <vault> [dir]        Create timestamped backup\n");
+    printf("  merge <vault> <other>       Merge another vault into this one\n");
+    printf("  compact <vault>             Remove deleted space from vault\n\n");
     printf("Notes & Clipboard:\n");
     printf("  note <vault> <name>         Add encrypted note (prompts for text)\n");
     printf("  read <vault> <name>         Read encrypted note\n");
@@ -128,45 +183,73 @@ static void usage(void) {
     printf("  paste <vault> <name>        Copy vault entry to clipboard\n\n");
     printf("Security:\n");
     printf("  shred <file> [passes]       Securely delete file (default: 3 passes)\n");
-    printf("  addshred <vault> <file>     Add file then shred original\n\n");
+    printf("  addshred <vault> <file>     Add file then shred original\n");
+    printf("  keygen <keyfile>            Generate a keyfile for 2FA\n\n");
     printf("Steganography:\n");
     printf("  hide <vault> <image.bmp>    Hide vault inside BMP image\n");
     printf("  unhide <image.bmp> <vault>  Extract vault from BMP image\n\n");
     printf("USB:\n");
     printf("  drives                      List USB drives\n");
     printf("  eject <drive>               Safely eject USB drive\n\n");
+    printf("Options:\n");
+    printf("  -k, --keyfile <file>        Use keyfile with password (2FA)\n");
+    printf("  --ok, --other-keyfile <f>   Keyfile for other vault (merge only)\n\n");
     printf("Emergency: Use password 'WIPE:yourpassword' to destroy vault\n");
 }
 
+/* Helper to find keyfile arg - forward declaration for use in original commands */
+static const char *find_keyfile_arg(int argc, char **argv, int *new_argc);
+
 static int cmd_create(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: gecko create <vault>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: gecko create <vault> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko create <vault> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_new_pw(pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_create(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_create_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_create(argv[0], pw, &v);
+    }
     gecko_secure_zero(pw, sizeof(pw));
     if (e != GECKO_OK) { fprintf(stderr, "Error: failed to create vault\n"); return 1; }
     
     gecko_vault_close(v);
     printf("Created: %s\n", argv[0]);
+    if (keyfile) printf("Note: This vault requires keyfile '%s' to open\n", keyfile);
     return 0;
 }
 
 static int cmd_add(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko add <vault> <file> [name]\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko add <vault> <file> [name] [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko add <vault> <file> [name] [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
     
-    const char *name = argc > 2 ? argv[2] : NULL;
+    const char *name = new_argc > 2 ? argv[2] : NULL;
     e = gecko_vault_add(v, argv[1], name);
     if (e != GECKO_OK) {
         fprintf(stderr, "Error: failed to add file\n");
@@ -179,13 +262,23 @@ static int cmd_add(int argc, char **argv) {
 }
 
 static int cmd_addshred(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko addshred <vault> <file>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko addshred <vault> <file> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko addshred <vault> <file> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -210,13 +303,23 @@ static int cmd_addshred(int argc, char **argv) {
 }
 
 static int cmd_get(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko get <vault> <name> [dest]\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko get <vault> <name> [dest] [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko get <vault> <name> [dest] [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -224,7 +327,7 @@ static int cmd_get(int argc, char **argv) {
     char dest[GECKO_MAX_PATH];
     memset(dest, 0, sizeof(dest));
     int n;
-    if (argc > 2) {
+    if (new_argc > 2) {
         if (strstr(argv[2], "..") != NULL) {
             fprintf(stderr, "Error: invalid path\n");
             gecko_vault_close(v);
@@ -251,13 +354,23 @@ static int cmd_get(int argc, char **argv) {
 }
 
 static int cmd_ls(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: gecko ls <vault>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: gecko ls <vault> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko ls <vault> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -278,13 +391,23 @@ static int cmd_ls(int argc, char **argv) {
 }
 
 static int cmd_rm(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko rm <vault> <name>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko rm <vault> <name> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko rm <vault> <name> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -297,13 +420,23 @@ static int cmd_rm(int argc, char **argv) {
 }
 
 static int cmd_info(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: gecko info <vault>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: gecko info <vault> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko info <vault> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -324,14 +457,24 @@ static int cmd_info(int argc, char **argv) {
 }
 
 static int cmd_passwd(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: gecko passwd <vault>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: gecko passwd <vault> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko passwd <vault> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW], newpw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     memset(newpw, 0, sizeof(newpw));
     if (read_pw("Current password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     gecko_secure_zero(pw, sizeof(pw));
     if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     
@@ -346,13 +489,23 @@ static int cmd_passwd(int argc, char **argv) {
 }
 
 static int cmd_verify(int argc, char **argv) {
-    if (argc < 1) { fprintf(stderr, "Usage: gecko verify <vault>\n"); return 1; }
+    if (argc < 1) { fprintf(stderr, "Usage: gecko verify <vault> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko verify <vault> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     gecko_secure_zero(pw, sizeof(pw));
     if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     
@@ -370,34 +523,76 @@ static int cmd_verify(int argc, char **argv) {
 
 static int read_note_text(char *buf, size_t max) {
     if (!buf || max < 2) return -1;
-    printf("Note text (end with empty line):\n");
+    memset(buf, 0, max);
+    printf("Note text (end with empty line, Ctrl+D to cancel):\n");
     fflush(stdout);
+    
+#ifndef GECKO_WINDOWS
+    /* Setup signal handler for Ctrl+C */
+    struct sigaction sa, old_sa;
+    sa.sa_handler = sigint_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, &old_sa);
+    g_interrupted = 0;
+#endif
+    
     size_t total = 0;
     char line[1024];
     while (fgets(line, sizeof(line), stdin)) {
+#ifndef GECKO_WINDOWS
+        if (g_interrupted) {
+            g_interrupted = 0;
+            sigaction(SIGINT, &old_sa, NULL);
+            gecko_secure_zero(buf, max);
+            gecko_secure_zero(line, sizeof(line));
+            fprintf(stderr, "\nCancelled\n");
+            return -1;
+        }
+#endif
         size_t len = strlen(line);
         if (len == 0 || (len == 1 && line[0] == '\n')) break;
         if (total + len >= max - 1) {
             fprintf(stderr, "Error: note too long\n");
             gecko_secure_zero(buf, max);
+            gecko_secure_zero(line, sizeof(line));
+#ifndef GECKO_WINDOWS
+            sigaction(SIGINT, &old_sa, NULL);
+#endif
             return -1;
         }
         memcpy(buf + total, line, len);
         total += len;
     }
+    
+    gecko_secure_zero(line, sizeof(line));
+#ifndef GECKO_WINDOWS
+    sigaction(SIGINT, &old_sa, NULL);
+#endif
+    
     buf[total] = '\0';
     if (total > 0 && buf[total-1] == '\n') buf[--total] = '\0';
     return (total > 0) ? 0 : -1;
 }
 
 static int cmd_note(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko note <vault> <name>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko note <vault> <name> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko note <vault> <name> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -419,13 +614,23 @@ static int cmd_note(int argc, char **argv) {
 }
 
 static int cmd_read(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko read <vault> <name>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko read <vault> <name> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko read <vault> <name> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -443,13 +648,23 @@ static int cmd_read(int argc, char **argv) {
 }
 
 static int cmd_clip(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko clip <vault> <name>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko clip <vault> <name> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko clip <vault> <name> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -482,13 +697,23 @@ static int cmd_clip(int argc, char **argv) {
 }
 
 static int cmd_paste(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "Usage: gecko paste <vault> <name>\n"); return 1; }
+    if (argc < 2) { fprintf(stderr, "Usage: gecko paste <vault> <name> [-k keyfile]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko paste <vault> <name> [-k keyfile]\n"); return 1; }
+    
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
     if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
-    gecko_error_t e = gecko_vault_open(argv[0], pw, &v);
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
     if (e != GECKO_OK) { gecko_secure_zero(pw, sizeof(pw)); fprintf(stderr, "Error: failed to open vault\n"); return 1; }
     if (check_emergency(pw, v)) { gecko_secure_zero(pw, sizeof(pw)); return 0; }
     gecko_secure_zero(pw, sizeof(pw));
@@ -602,6 +827,317 @@ static int cmd_eject(int argc, char **argv) {
     return 0;
 }
 
+
+/* Thread-local storage for filtered args to avoid corrupting original argv */
+static char *g_filtered_argv[MAX_ARGS];
+
+static const char *find_keyfile_arg(int argc, char **argv, int *new_argc) {
+    const char *keyfile = NULL;
+    *new_argc = 0;
+    
+    if (argc > MAX_ARGS) argc = MAX_ARGS;  /* Prevent overflow */
+    
+    for (int i = 0; i < argc; i++) {
+        if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--keyfile") == 0) && i + 1 < argc) {
+            keyfile = argv[i + 1];
+            i++;  /* Skip keyfile path */
+        } else {
+            /* Store in separate array, don't modify original argv */
+            g_filtered_argv[*new_argc] = argv[i];
+            (*new_argc)++;
+        }
+    }
+    
+    /* Point argv entries to filtered array for caller convenience */
+    for (int i = 0; i < *new_argc; i++) {
+        argv[i] = g_filtered_argv[i];
+    }
+    
+    return keyfile;
+}
+
+static int cmd_search(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko search <vault> <pattern>\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko search <vault> <pattern>\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    gecko_vault_entry_t *entries = NULL;
+    uint32_t count = 0;
+    e = gecko_vault_search(v, argv[1], &entries, &count);
+    if (e != GECKO_OK) {
+        gecko_vault_close(v);
+        fprintf(stderr, "Error: search failed\n");
+        return 1;
+    }
+    
+    if (count == 0) {
+        printf("No matches for '%s'\n", argv[1]);
+    } else {
+        printf("Found %u match%s:\n", count, count == 1 ? "" : "es");
+        for (uint32_t i = 0; i < count; i++) {
+            char sz[32];
+            if (entries[i].size < 1024) snprintf(sz, sizeof(sz), "%llu B", (unsigned long long)entries[i].size);
+            else if (entries[i].size < 1024*1024) snprintf(sz, sizeof(sz), "%.1f KB", entries[i].size / 1024.0);
+            else snprintf(sz, sizeof(sz), "%.1f MB", entries[i].size / (1024.0 * 1024.0));
+            printf("  %-40s %10s\n", entries[i].name, sz);
+        }
+    }
+    
+    if (entries) free(entries);
+    gecko_vault_close(v);
+    return 0;
+}
+
+static int cmd_import(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko import <vault> <directory> [prefix]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko import <vault> <directory> [prefix]\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    const char *prefix = new_argc > 2 ? argv[2] : NULL;
+    e = gecko_vault_import(v, argv[1], prefix);
+    if (e != GECKO_OK) {
+        gecko_vault_close(v);
+        fprintf(stderr, "Error: import failed\n");
+        return 1;
+    }
+    
+    e = gecko_vault_save(v);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: save failed\n"); return 1; }
+    
+    printf("Import complete\n");
+    return 0;
+}
+
+static int cmd_export(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko export <vault> <directory>\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko export <vault> <directory>\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    e = gecko_vault_export(v, argv[1]);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: export failed\n"); return 1; }
+    
+    printf("Export complete: %s\n", argv[1]);
+    return 0;
+}
+
+static int cmd_backup(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: gecko backup <vault> [backup_dir]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko backup <vault> [backup_dir]\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    const char *backup_dir = new_argc > 1 ? argv[1] : ".";
+    char backup_path[GECKO_MAX_PATH];
+    memset(backup_path, 0, sizeof(backup_path));  /* Initialize to prevent use of uninitialized data */
+    e = gecko_vault_backup(v, backup_dir, backup_path, sizeof(backup_path));
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: backup failed\n"); return 1; }
+    
+    printf("Backup created: %s\n", backup_path);
+    return 0;
+}
+
+static int cmd_merge(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko merge <vault> <other_vault> [-k keyfile] [--ok other_keyfile]\n"); return 1; }
+    
+    /* Parse both keyfile options */
+    const char *keyfile = NULL;
+    const char *other_keyfile = NULL;
+    int new_argc = 0;
+    
+    if (argc > MAX_ARGS) argc = MAX_ARGS;
+    
+    for (int i = 0; i < argc; i++) {
+        if ((strcmp(argv[i], "-k") == 0 || strcmp(argv[i], "--keyfile") == 0) && i + 1 < argc) {
+            keyfile = argv[i + 1];
+            i++;
+        } else if ((strcmp(argv[i], "--ok") == 0 || strcmp(argv[i], "--other-keyfile") == 0) && i + 1 < argc) {
+            other_keyfile = argv[i + 1];
+            i++;
+        } else {
+            g_filtered_argv[new_argc] = argv[i];
+            new_argc++;
+        }
+    }
+    for (int i = 0; i < new_argc; i++) argv[i] = g_filtered_argv[i];
+    
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko merge <vault> <other_vault> [-k keyfile] [--ok other_keyfile]\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password for main vault: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    char other_pw[MAX_PW];
+    memset(other_pw, 0, sizeof(other_pw));
+    if (read_pw("Password for other vault: ", other_pw, sizeof(other_pw)) < 0) {
+        gecko_secure_zero(other_pw, sizeof(other_pw));
+        gecko_vault_close(v);
+        return 1;
+    }
+    
+    if (other_keyfile) {
+        e = gecko_vault_merge_with_keyfile(v, argv[1], other_pw, other_keyfile);
+    } else {
+        e = gecko_vault_merge(v, argv[1], other_pw);
+    }
+    gecko_secure_zero(other_pw, sizeof(other_pw));
+    if (e != GECKO_OK) {
+        gecko_vault_close(v);
+        fprintf(stderr, "Error: merge failed\n");
+        return 1;
+    }
+    
+    e = gecko_vault_save(v);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: save failed\n"); return 1; }
+    
+    printf("Merge complete\n");
+    return 0;
+}
+
+static int cmd_compact(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: gecko compact <vault>\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 1) { fprintf(stderr, "Usage: gecko compact <vault>\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    e = gecko_vault_compact(v);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: compact failed\n"); return 1; }
+    
+    printf("Vault compacted\n");
+    return 0;
+}
+
+static int cmd_cat(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko cat <vault> <name>\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko cat <vault> <name>\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    e = gecko_vault_cat(v, argv[1]);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: file not found\n"); return 1; }
+    
+    return 0;
+}
+
+static int cmd_keygen(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "Usage: gecko keygen <keyfile>\n"); return 1; }
+    
+    gecko_error_t e = gecko_vault_generate_keyfile(argv[0]);
+    if (e == GECKO_ERR_EXISTS) {
+        fprintf(stderr, "Error: keyfile already exists\n");
+        return 1;
+    }
+    if (e != GECKO_OK) {
+        fprintf(stderr, "Error: failed to generate keyfile\n");
+        return 1;
+    }
+    
+    printf("Keyfile created: %s\n", argv[0]);
+    printf("IMPORTANT: Store this keyfile securely! Without it, you cannot open the vault.\n");
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
     
@@ -615,14 +1151,22 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "get"))        return cmd_get(cargc, cargv);
     if (!strcmp(cmd, "ls"))         return cmd_ls(cargc, cargv);
     if (!strcmp(cmd, "rm"))         return cmd_rm(cargc, cargv);
+    if (!strcmp(cmd, "cat"))        return cmd_cat(cargc, cargv);
     if (!strcmp(cmd, "info"))       return cmd_info(cargc, cargv);
     if (!strcmp(cmd, "passwd"))     return cmd_passwd(cargc, cargv);
     if (!strcmp(cmd, "verify"))     return cmd_verify(cargc, cargv);
+    if (!strcmp(cmd, "search"))     return cmd_search(cargc, cargv);
+    if (!strcmp(cmd, "import"))     return cmd_import(cargc, cargv);
+    if (!strcmp(cmd, "export"))     return cmd_export(cargc, cargv);
+    if (!strcmp(cmd, "backup"))     return cmd_backup(cargc, cargv);
+    if (!strcmp(cmd, "merge"))      return cmd_merge(cargc, cargv);
+    if (!strcmp(cmd, "compact"))    return cmd_compact(cargc, cargv);
     if (!strcmp(cmd, "note"))       return cmd_note(cargc, cargv);
     if (!strcmp(cmd, "read"))       return cmd_read(cargc, cargv);
     if (!strcmp(cmd, "clip"))       return cmd_clip(cargc, cargv);
     if (!strcmp(cmd, "paste"))      return cmd_paste(cargc, cargv);
     if (!strcmp(cmd, "shred"))      return cmd_shred(cargc, cargv);
+    if (!strcmp(cmd, "keygen"))     return cmd_keygen(cargc, cargv);
     if (!strcmp(cmd, "hide"))       return cmd_hide(cargc, cargv);
     if (!strcmp(cmd, "unhide"))     return cmd_unhide(cargc, cargv);
     if (!strcmp(cmd, "drives"))     return cmd_drives();

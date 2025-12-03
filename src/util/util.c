@@ -6,17 +6,21 @@
 
 #include "gecko.h"
 #include "gecko/util.h"
+#include "gecko/crypto.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <time.h>
 
 #ifdef GECKO_WINDOWS
 #include <windows.h>
+#define gecko_strdup _strdup
 #else
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#define gecko_strdup strdup
 #endif
 
 /*
@@ -396,8 +400,6 @@ const char *gecko_error_string(gecko_error_t err) {
     }
 }
 
-/* ============== Secure File Shredding ============== */
-
 gecko_error_t gecko_shred_file(const char *path, int passes) {
     if (!path || passes < 1) return GECKO_ERR_INVALID_PARAM;
     if (passes > 10) passes = 10;  /* Cap at 10 passes */
@@ -455,8 +457,6 @@ gecko_error_t gecko_shred_file(const char *path, int passes) {
     return unlink(path) == 0 ? GECKO_OK : GECKO_ERR_IO;
 #endif
 }
-
-/* ============== Clipboard Operations ============== */
 
 #ifdef GECKO_WINDOWS
 
@@ -589,8 +589,6 @@ gecko_error_t gecko_clipboard_set(const char *text, size_t len) {
 
 #endif
 
-/* ============== Steganography (LSB in PNG/BMP) ============== */
-
 /* Simple LSB steganography - hides data in least significant bits of image pixels */
 
 gecko_error_t gecko_steg_hide(const char *image_path, const uint8_t *data, size_t len,
@@ -611,7 +609,7 @@ gecko_error_t gecko_steg_hide(const char *image_path, const uint8_t *data, size_
     
     /* Parse BMP header */
     uint32_t data_offset = img[10] | (img[11] << 8) | (img[12] << 16) | (img[13] << 24);
-    uint32_t pixel_size = img_size - data_offset;
+    uint32_t pixel_size = (uint32_t)(img_size - data_offset);
     
     /* Need 8 pixels per byte (1 bit per pixel) + 32 bits for length header */
     size_t needed_pixels = (len + 4) * 8;
@@ -662,7 +660,7 @@ gecko_error_t gecko_steg_extract(const char *image_path, uint8_t **data, size_t 
     }
     
     uint32_t data_offset = img[10] | (img[11] << 8) | (img[12] << 16) | (img[13] << 24);
-    uint32_t pixel_size = img_size - data_offset;
+    uint32_t pixel_size = (uint32_t)(img_size - data_offset);
     
     if (pixel_size < 32) {
         free(img);
@@ -703,3 +701,313 @@ gecko_error_t gecko_steg_extract(const char *image_path, uint8_t **data, size_t 
     return GECKO_OK;
 }
 
+#ifdef GECKO_WINDOWS
+
+gecko_error_t gecko_list_dir(const char *path, char ***files, uint32_t *count) {
+    if (!path || !files || !count) return GECKO_ERR_INVALID_PARAM;
+    
+    *files = NULL;
+    *count = 0;
+    
+    char search_path[GECKO_MAX_PATH];
+    snprintf(search_path, sizeof(search_path), "%s\\*", path);
+    
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search_path, &fd);
+    if (h == INVALID_HANDLE_VALUE) return GECKO_ERR_FILE_NOT_FOUND;
+    
+    /* Count files first */
+    uint32_t n = 0;
+    do {
+        if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || 
+            (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) n++;
+    } while (FindNextFileA(h, &fd));
+    
+    if (n == 0) { FindClose(h); return GECKO_OK; }
+    
+    /* Allocate array */
+    char **result = calloc(n, sizeof(char *));
+    if (!result) { FindClose(h); return GECKO_ERR_NO_MEMORY; }
+    
+    /* Restart and fill */
+    h = FindFirstFileA(search_path, &fd);
+    uint32_t i = 0;
+    do {
+        if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || 
+            (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) continue;
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            char full[GECKO_MAX_PATH];
+            snprintf(full, sizeof(full), "%s\\%s", path, fd.cFileName);
+            result[i] = gecko_strdup(full);
+            if (!result[i]) {
+                gecko_free_file_list(result, i);
+                FindClose(h);
+                return GECKO_ERR_NO_MEMORY;
+            }
+            i++;
+        }
+    } while (FindNextFileA(h, &fd) && i < n);
+    
+    FindClose(h);
+    *files = result;
+    *count = i;
+    return GECKO_OK;
+}
+
+static gecko_error_t list_recursive_internal(const char *path, char ***files, 
+                                              uint32_t *count, uint32_t *capacity) {
+    char search_path[GECKO_MAX_PATH];
+    snprintf(search_path, sizeof(search_path), "%s\\*", path);
+    
+    WIN32_FIND_DATAA fd;
+    HANDLE h = FindFirstFileA(search_path, &fd);
+    if (h == INVALID_HANDLE_VALUE) return GECKO_OK;
+    
+    do {
+        if (fd.cFileName[0] == '.' && (fd.cFileName[1] == '\0' || 
+            (fd.cFileName[1] == '.' && fd.cFileName[2] == '\0'))) continue;
+        
+        char full[GECKO_MAX_PATH];
+        snprintf(full, sizeof(full), "%s\\%s", path, fd.cFileName);
+        
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            list_recursive_internal(full, files, count, capacity);
+        } else {
+            if (*count >= *capacity) {
+                uint32_t new_cap = *capacity * 2;
+                char **new_files = realloc(*files, new_cap * sizeof(char *));
+                if (!new_files) { FindClose(h); return GECKO_ERR_NO_MEMORY; }
+                *files = new_files;
+                *capacity = new_cap;
+            }
+            (*files)[*count] = gecko_strdup(full);
+            if (!(*files)[*count]) { FindClose(h); return GECKO_ERR_NO_MEMORY; }
+            (*count)++;
+        }
+    } while (FindNextFileA(h, &fd));
+    
+    FindClose(h);
+    return GECKO_OK;
+}
+
+#else /* Linux/Unix */
+
+#include <dirent.h>
+#include <sys/types.h>
+
+gecko_error_t gecko_list_dir(const char *path, char ***files, uint32_t *count) {
+    if (!path || !files || !count) return GECKO_ERR_INVALID_PARAM;
+    
+    *files = NULL;
+    *count = 0;
+    
+    DIR *d = opendir(path);
+    if (!d) return GECKO_ERR_FILE_NOT_FOUND;
+    
+    /* Count files first */
+    uint32_t n = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        char full[GECKO_MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) n++;
+    }
+    
+    if (n == 0) { closedir(d); return GECKO_OK; }
+    
+    /* Allocate and fill */
+    char **result = calloc(n, sizeof(char *));
+    if (!result) { closedir(d); return GECKO_ERR_NO_MEMORY; }
+    
+    rewinddir(d);
+    uint32_t i = 0;
+    while ((ent = readdir(d)) != NULL && i < n) {
+        if (ent->d_name[0] == '.') continue;
+        char full[GECKO_MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        struct stat st;
+        if (stat(full, &st) == 0 && S_ISREG(st.st_mode)) {
+            result[i] = gecko_strdup(full);
+            if (!result[i]) {
+                gecko_free_file_list(result, i);
+                closedir(d);
+                return GECKO_ERR_NO_MEMORY;
+            }
+            i++;
+        }
+    }
+    
+    closedir(d);
+    *files = result;
+    *count = i;
+    return GECKO_OK;
+}
+
+static gecko_error_t list_recursive_internal(const char *path, char ***files, 
+                                              uint32_t *count, uint32_t *capacity) {
+    DIR *d = opendir(path);
+    if (!d) return GECKO_OK;
+    
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (ent->d_name[0] == '.') continue;
+        
+        char full[GECKO_MAX_PATH];
+        snprintf(full, sizeof(full), "%s/%s", path, ent->d_name);
+        
+        struct stat st;
+        if (stat(full, &st) != 0) continue;
+        
+        if (S_ISDIR(st.st_mode)) {
+            list_recursive_internal(full, files, count, capacity);
+        } else if (S_ISREG(st.st_mode)) {
+            if (*count >= *capacity) {
+                uint32_t new_cap = *capacity * 2;
+                char **new_files = realloc(*files, new_cap * sizeof(char *));
+                if (!new_files) { closedir(d); return GECKO_ERR_NO_MEMORY; }
+                *files = new_files;
+                *capacity = new_cap;
+            }
+            (*files)[*count] = gecko_strdup(full);
+            if (!(*files)[*count]) { closedir(d); return GECKO_ERR_NO_MEMORY; }
+            (*count)++;
+        }
+    }
+    
+    closedir(d);
+    return GECKO_OK;
+}
+
+#endif
+
+gecko_error_t gecko_list_dir_recursive(const char *path, char ***files, uint32_t *count) {
+    if (!path || !files || !count) return GECKO_ERR_INVALID_PARAM;
+    
+    *files = NULL;
+    *count = 0;
+    
+    uint32_t capacity = 64;
+    char **result = calloc(capacity, sizeof(char *));
+    if (!result) return GECKO_ERR_NO_MEMORY;
+    
+    gecko_error_t e = list_recursive_internal(path, &result, count, &capacity);
+    if (e != GECKO_OK) {
+        gecko_free_file_list(result, *count);
+        *files = NULL;
+        *count = 0;
+        return e;
+    }
+    
+    *files = result;
+    return GECKO_OK;
+}
+
+void gecko_free_file_list(char **files, uint32_t count) {
+    if (!files) return;
+    for (uint32_t i = 0; i < count; i++) {
+        free(files[i]);
+    }
+    free(files);
+}
+
+/* Pattern matching (supports * and ?) */
+bool gecko_pattern_match(const char *pattern, const char *str) {
+    if (!pattern || !str) return false;
+    
+    while (*pattern && *str) {
+        if (*pattern == '*') {
+            pattern++;
+            if (*pattern == '\0') return true;
+            while (*str) {
+                if (gecko_pattern_match(pattern, str)) return true;
+                str++;
+            }
+            return false;
+        } else if (*pattern == '?' || *pattern == *str) {
+            pattern++;
+            str++;
+        } else {
+            return false;
+        }
+    }
+    
+    while (*pattern == '*') pattern++;
+    return *pattern == '\0' && *str == '\0';
+}
+
+/* Get current timestamp string */
+gecko_error_t gecko_timestamp_string(char *buf, size_t len) {
+    if (!buf || len < 16) return GECKO_ERR_INVALID_PARAM;
+    
+#ifdef GECKO_WINDOWS
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(buf, len, "%04d%02d%02d_%02d%02d%02d",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
+#else
+    time_t t = time(NULL);
+    struct tm *tm = localtime(&t);
+    if (!tm) return GECKO_ERR_IO;
+    snprintf(buf, len, "%04d%02d%02d_%02d%02d%02d",
+             tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
+             tm->tm_hour, tm->tm_min, tm->tm_sec);
+#endif
+    return GECKO_OK;
+}
+
+/* Combine keyfile with password for 2FA */
+gecko_error_t gecko_combine_keyfile(const char *password, const char *keyfile_path,
+                                     uint8_t *combined_key, size_t key_len) {
+    if (!password || !keyfile_path || !combined_key || key_len < 32)
+        return GECKO_ERR_INVALID_PARAM;
+    
+    /* Read keyfile */
+    uint8_t *keydata = NULL;
+    size_t keydata_len = 0;
+    gecko_error_t e = gecko_read_file(keyfile_path, &keydata, &keydata_len);
+    if (e != GECKO_OK) return e;
+    
+    if (keydata_len < 32) {
+        free(keydata);
+        return GECKO_ERR_FORMAT;
+    }
+    
+    /* Hash password */
+    uint8_t pw_hash[32];
+    gecko_sha256((const uint8_t *)password, strlen(password), pw_hash);
+    
+    /* Hash keyfile */
+    uint8_t kf_hash[32];
+    gecko_sha256(keydata, keydata_len, kf_hash);
+    gecko_secure_zero(keydata, keydata_len);
+    free(keydata);
+    
+    /* XOR and hash again for combined key */
+    uint8_t xored[32];
+    for (int i = 0; i < 32; i++) {
+        xored[i] = pw_hash[i] ^ kf_hash[i];
+    }
+    
+    /* Final hash as combined key */
+    if (key_len >= 64) {
+        /* Output both hashes concatenated for more entropy */
+        gecko_sha256(xored, 32, combined_key);
+        uint8_t temp[64];
+        memcpy(temp, pw_hash, 32);
+        memcpy(temp + 32, kf_hash, 32);
+        gecko_sha256(temp, 64, combined_key + 32);
+        gecko_secure_zero(temp, 64);
+    } else {
+        gecko_sha256(xored, 32, combined_key);
+    }
+    
+    gecko_secure_zero(pw_hash, 32);
+    gecko_secure_zero(kf_hash, 32);
+    gecko_secure_zero(xored, 32);
+    
+    return GECKO_OK;
+}

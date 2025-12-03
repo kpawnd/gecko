@@ -1,0 +1,178 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Gecko Documentation</title>
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <header>
+    <div class="container">
+      <div class="logo">🦎</div>
+      <h1>Gecko Documentation</h1>
+      <p class="tagline">Encrypted USB vault utility — v1.1.0</p>
+      <div class="buttons">
+        <a href="index.html" class="btn btn-secondary">Back to Home</a>
+        <a href="https://github.com/kpawnd/gecko/releases/latest" class="btn btn-primary">Download</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="doc container">
+    <section>
+      <h1>Overview</h1>
+      <p class="version">Version 1.1.0 · AES-256-GCM · PBKDF2-HMAC-SHA256 (600k)</p>
+      <p>Gecko is a portable CLI vault for securely storing files and notes. This page documents all commands and advanced features including keyfile 2FA, search, import/export, backup, merge, and compact.</p>
+    </section>
+
+    <section>
+    <div class="toc container">
+      <strong>Table of Contents</strong>
+      <a href="#install">Installation</a>
+      <a href="#basics">Basics</a>
+      <a href="#files">File Operations</a>
+      <a href="#notes">Notes</a>
+      <a href="#search">Search</a>
+      <a href="#importexport">Import / Export</a>
+      <a href="#backup">Backup</a>
+      <a href="#merge">Merge</a>
+      <a href="#compact">Compact</a>
+      <a href="#keyfile">Keyfile 2FA</a>
+      <a href="#steg">Steganography</a>
+      <a href="#wipe">Emergency Wipe</a>
+      <a href="#audit">Audit Logging</a>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="install">Installation</h2>
+    <div class="grid">
+      <div class="feature">
+        <h3>Windows</h3>
+        <div class="code-block">Download installer or portable EXE from Releases.</div>
+      </div>
+      <div class="feature">
+        <h3>Linux</h3>
+        <div class="code-block">tar -xzf gecko-linux-x64.tar.gz<br/>sudo mv gecko /usr/local/bin/</div>
+      </div>
+      <div class="feature">
+        <h3>Build from source</h3>
+        <div class="code-block">git clone https://github.com/kpawnd/gecko.git<br/>cd gecko<br/>cmake -B build -DCMAKE_BUILD_TYPE=Release<br/>cmake --build build</div>
+      </div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="basics">Basics</h2>
+    <div class="grid">
+      <div class="feature"><h3>Create Vault</h3><div class="code-block">gecko create -v vault.gko -p &lt;password&gt;</div></div>
+      <div class="feature"><h3>Open / Info</h3><div class="code-block">gecko info -v vault.gko -p &lt;password&gt;</div></div>
+      <div class="feature"><h3>Verify</h3><div class="code-block">gecko verify -v vault.gko -p &lt;password&gt;</div></div>
+      <div class="feature"><h3>Change Password</h3><div class="code-block">gecko passwd -v vault.gko -p &lt;old&gt; -n &lt;new&gt;</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="files">File Operations</h2>
+    <div class="grid">
+      <div class="feature"><h3>Add</h3><div class="code-block">gecko add -v vault.gko -p &lt;pw&gt; -f file.txt -n file.txt</div></div>
+      <div class="feature"><h3>List</h3><div class="code-block">gecko ls -v vault.gko -p &lt;pw&gt;</div></div>
+      <div class="feature"><h3>Get</h3><div class="code-block">gecko get -v vault.gko -p &lt;pw&gt; -n file.txt -o out.txt</div></div>
+      <div class="feature"><h3>Remove</h3><div class="code-block">gecko rm -v vault.gko -p &lt;pw&gt; -n file.txt</div></div>
+      <div class="feature"><h3>Cat</h3><div class="code-block">gecko cat -v vault.gko -p &lt;pw&gt; -n file.txt</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="notes">Notes</h2>
+    <div class="grid">
+      <div class="feature"><h3>Add Note</h3><div class="code-block">gecko note -v vault.gko -p &lt;pw&gt; -n mynote -t "content"</div></div>
+      <div class="feature"><h3>Read Note</h3><div class="code-block">gecko read -v vault.gko -p &lt;pw&gt; -n mynote</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="search">Search</h2>
+    <div class="grid">
+      <div class="feature"><h3>Pattern Match</h3><div class="code-block">gecko search -v vault.gko -p &lt;pw&gt; -q "*.pdf"</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="importexport">Import / Export</h2>
+    <div class="grid">
+      <div class="feature"><h3>Import Directory</h3><div class="code-block">gecko import -v vault.gko -p &lt;pw&gt; -d ./docs -x "*"</div></div>
+      <div class="feature"><h3>Export Vault</h3><div class="code-block">gecko export -v vault.gko -p &lt;pw&gt; -d ./out</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="backup">Backup</h2>
+    <div class="grid">
+      <div class="feature"><h3>Timestamped Backup</h3><div class="code-block">gecko backup -v vault.gko -p &lt;pw&gt; -d ./backups</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="merge">Merge</h2>
+    <div class="grid">
+      <div class="feature"><h3>Password-only Vaults</h3><div class="code-block">gecko merge -v main.gko -p &lt;pw&gt; -o other.gko -op &lt;otherpw&gt;</div></div>
+      <div class="feature"><h3>Keyfile Vaults <span class="badge">2FA</span></h3><div class="code-block">gecko merge -v main.gko -p &lt;pw&gt; -k main.key -o other.gko -op &lt;otherpw&gt; --ok other.key</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="compact">Compact</h2>
+    <div class="grid">
+      <div class="feature"><h3>Reclaim Space</h3><div class="code-block">gecko compact -v vault.gko -p &lt;pw&gt;</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="keyfile">Keyfile 2FA</h2>
+    <div class="grid">
+      <div class="feature"><h3>Generate Keyfile</h3><div class="code-block">gecko keygen -o vault.key</div></div>
+      <div class="feature"><h3>Create with Keyfile</h3><div class="code-block">gecko create -v vault.gko -p &lt;pw&gt; -k vault.key</div></div>
+      <div class="feature"><h3>Use Keyfile</h3><div class="code-block">gecko add/get/ls -v vault.gko -p &lt;pw&gt; -k vault.key ...</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="steg">Steganography</h2>
+    <div class="grid">
+      <div class="feature"><h3>Hide Data</h3><div class="code-block">gecko hide -i cover.bmp -s secret.txt -o steg.bmp</div></div>
+      <div class="feature"><h3>Extract Data</h3><div class="code-block">gecko unhide -i steg.bmp -o extracted.txt</div></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="wipe">Emergency Wipe</h2>
+    <div class="grid">
+      <div class="feature"><h3>Destroy Vault</h3><div class="code-block">gecko shred -v vault.gko</div><p class="muted">Secure multi-pass overwrite followed by deletion.</p></div>
+    </div>
+    </section>
+
+    <section>
+    <h2 id="audit">Audit Logging</h2>
+    <div class="grid">
+      <div class="feature"><h3>Enable + Log</h3><div class="code-block">gecko info -v vault.gko -p &lt;pw&gt; --audit ./audit/log.txt</div><p class="muted">Records operations and events for forensics.</p></div>
+    </div>
+    </section>
+
+    <p class="muted">For API usage (embedding Gecko as a library), see headers in <code>include/gecko/*.h</code>.</p>
+  </main>
+
+  <footer>
+    <div class="container">
+      <p>
+        <a href="index.html">Home</a> · 
+        <a href="https://github.com/kpawnd/gecko">GitHub</a> · 
+        <a href="https://github.com/kpawnd/gecko/releases">Releases</a>
+      </p>
+    </div>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>

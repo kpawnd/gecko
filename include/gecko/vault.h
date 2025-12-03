@@ -96,6 +96,75 @@ gecko_error_t gecko_vault_read_data(gecko_vault_t *vault,
 /* Emergency wipe - destroy all vault data */
 gecko_error_t gecko_vault_emergency_wipe(gecko_vault_t *vault);
 
+/* Search for files by pattern (supports * and ? wildcards) */
+gecko_error_t gecko_vault_search(gecko_vault_t *vault,
+                                  const char *pattern,
+                                  gecko_vault_entry_t **entries,
+                                  uint32_t *count);
+
+/* Export all files to a directory */
+gecko_error_t gecko_vault_export(gecko_vault_t *vault,
+                                  const char *dest_dir);
+
+/* Import entire directory recursively */
+gecko_error_t gecko_vault_import(gecko_vault_t *vault,
+                                  const char *src_dir,
+                                  const char *prefix);
+
+/* Compact vault (remove deleted space) */
+gecko_error_t gecko_vault_compact(gecko_vault_t *vault);
+
+/* Create timestamped backup copy */
+gecko_error_t gecko_vault_backup(gecko_vault_t *vault,
+                                  const char *backup_dir,
+                                  char *backup_path,
+                                  size_t path_len);
+
+/* Merge another vault into this one */
+gecko_error_t gecko_vault_merge(gecko_vault_t *vault,
+                                 const char *other_path,
+                                 const char *other_password);
+
+/* Merge another vault (with keyfile) into this one */
+gecko_error_t gecko_vault_merge_with_keyfile(gecko_vault_t *vault,
+                                              const char *other_path,
+                                              const char *other_password,
+                                              const char *other_keyfile);
+
+/* Print file contents to stdout (cat) */
+gecko_error_t gecko_vault_cat(gecko_vault_t *vault,
+                               const char *name);
+
+/* Get vault path */
+const char *gecko_vault_get_path(gecko_vault_t *vault);
+
+/* Create vault with keyfile (2FA) */
+gecko_error_t gecko_vault_create_with_keyfile(const char *path,
+                                               const char *password,
+                                               const char *keyfile,
+                                               gecko_vault_t **vault);
+
+/* Open vault with keyfile */
+gecko_error_t gecko_vault_open_with_keyfile(const char *path,
+                                             const char *password,
+                                             const char *keyfile,
+                                             gecko_vault_t **vault);
+
+/* Generate a keyfile */
+gecko_error_t gecko_vault_generate_keyfile(const char *path);
+
+/* Check if vault uses keyfile */
+bool gecko_vault_uses_keyfile(gecko_vault_t *vault);
+
+/* Enable audit logging */
+gecko_error_t gecko_vault_enable_audit(gecko_vault_t *vault,
+                                        const char *log_path);
+
+/* Log an audit event */
+gecko_error_t gecko_vault_audit_log(gecko_vault_t *vault,
+                                     const char *action,
+                                     const char *details);
+
 #ifdef __cplusplus
 }
 #endif

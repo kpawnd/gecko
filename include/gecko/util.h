@@ -62,6 +62,33 @@ gecko_error_t gecko_steg_extract(const char *image_path,
 /* Get error message string */
 const char *gecko_error_string(gecko_error_t err);
 
+/* ===== Directory utilities ===== */
+
+/* List files in directory (non-recursive) */
+gecko_error_t gecko_list_dir(const char *path,
+                              char ***files,
+                              uint32_t *count);
+
+/* List files recursively */
+gecko_error_t gecko_list_dir_recursive(const char *path,
+                                        char ***files,
+                                        uint32_t *count);
+
+/* Free file list */
+void gecko_free_file_list(char **files, uint32_t count);
+
+/* Pattern matching (supports * and ?) */
+bool gecko_pattern_match(const char *pattern, const char *str);
+
+/* Get current timestamp string (YYYYMMDD_HHMMSS) */
+gecko_error_t gecko_timestamp_string(char *buf, size_t len);
+
+/* Combine keyfile with password for 2FA */
+gecko_error_t gecko_combine_keyfile(const char *password,
+                                     const char *keyfile_path,
+                                     uint8_t *combined_key,
+                                     size_t key_len);
+
 #ifdef __cplusplus
 }
 #endif

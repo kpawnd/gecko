@@ -11,9 +11,9 @@ extern "C" {
 
 /* Version */
 #define GECKO_VERSION_MAJOR 1
-#define GECKO_VERSION_MINOR 0
+#define GECKO_VERSION_MINOR 1
 #define GECKO_VERSION_PATCH 0
-#define GECKO_VERSION_STRING "1.0.0"
+#define GECKO_VERSION_STRING "1.1.0"
 
 /* Platform detection */
 #if defined(_WIN32) || defined(_WIN64)

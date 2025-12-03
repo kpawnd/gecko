@@ -1,15 +1,3 @@
-/*
- * Gecko Vault - Hardened encrypted file container
- * 
- * Security features:
- *   - AES-256-GCM authenticated encryption
- *   - PBKDF2-HMAC-SHA256 key derivation (600k iterations)
- *   - Fresh random IV for every encryption
- *   - Authenticated metadata prevents tampering
- *   - Secure memory wiping of sensitive data
- *   - Atomic file operations via tmp+rename
- */
-
 #include "gecko.h"
 #include "gecko/vault.h"
 #include "gecko/crypto.h"
@@ -737,8 +725,6 @@ bool gecko_vault_exists(const char *path) {
     return gecko_file_exists(path);
 }
 
-/* ============== Secure Notes ============== */
-
 gecko_error_t gecko_vault_add_note(gecko_vault_t *v, const char *name, const char *content) {
     if (!v || !v->open || !name || !content) return GECKO_ERR_INVALID_PARAM;
     
@@ -772,8 +758,6 @@ gecko_error_t gecko_vault_read_note(gecko_vault_t *v, const char *name, char **c
     *content = str;
     return GECKO_OK;
 }
-
-/* ============== Data Operations (for clipboard, notes, etc.) ============== */
 
 gecko_error_t gecko_vault_add_data(gecko_vault_t *v, const char *name, const uint8_t *data, size_t len) {
     if (!v || !v->open || !name || !data) return GECKO_ERR_INVALID_PARAM;
@@ -890,8 +874,6 @@ gecko_error_t gecko_vault_read_data(gecko_vault_t *v, const char *name, uint8_t 
     return GECKO_OK;
 }
 
-/* ============== Emergency Wipe ============== */
-
 gecko_error_t gecko_vault_emergency_wipe(gecko_vault_t *v) {
     if (!v) return GECKO_ERR_INVALID_PARAM;
     
@@ -917,7 +899,7 @@ gecko_error_t gecko_vault_emergency_wipe(gecko_vault_t *v) {
                             gecko_random_bytes(junk, chunk);
                         }
                         fwrite(junk, 1, chunk, f);
-                        remaining -= chunk;
+                        remaining -= (long)chunk;
                     }
                     fflush(f);
                 }
@@ -964,3 +946,317 @@ gecko_error_t gecko_vault_emergency_wipe(gecko_vault_t *v) {
     return GECKO_OK;
 }
 
+
+/* ===== New High-Value Features ===== */
+
+const char *gecko_vault_get_path(gecko_vault_t *vault) {
+    if (!vault) return NULL;
+    return vault->path;
+}
+
+gecko_error_t gecko_vault_search(gecko_vault_t *vault, const char *pattern,
+                                  gecko_vault_entry_t **entries, uint32_t *count) {
+    if (!vault || !vault->open || !pattern || !entries || !count)
+        return GECKO_ERR_INVALID_PARAM;
+    
+    *entries = NULL;
+    *count = 0;
+    
+    /* Count matches first */
+    uint32_t match_count = 0;
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (gecko_pattern_match(pattern, vault->entries[i].name)) {
+            match_count++;
+        }
+    }
+    
+    if (match_count == 0) return GECKO_OK;
+    
+    /* Allocate and fill */
+    gecko_vault_entry_t *result = calloc(match_count, sizeof(gecko_vault_entry_t));
+    if (!result) return GECKO_ERR_NO_MEMORY;
+    
+    uint32_t j = 0;
+    for (uint32_t i = 0; i < vault->count && j < match_count; i++) {
+        if (gecko_pattern_match(pattern, vault->entries[i].name)) {
+            memcpy(&result[j], &vault->entries[i], sizeof(gecko_vault_entry_t));
+            j++;
+        }
+    }
+    
+    *entries = result;
+    *count = match_count;
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_export(gecko_vault_t *vault, const char *dest_dir) {
+    if (!vault || !vault->open || !dest_dir) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Create destination directory */
+    gecko_error_t e = gecko_mkdir_p(dest_dir);
+    if (e != GECKO_OK) return e;
+    
+    uint32_t exported = 0;
+    for (uint32_t i = 0; i < vault->count; i++) {
+        char dest_path[GECKO_MAX_PATH];
+        snprintf(dest_path, sizeof(dest_path), "%s%c%s",
+                 dest_dir, GECKO_PATH_SEP, vault->entries[i].name);
+        
+        e = gecko_vault_extract(vault, vault->entries[i].name, dest_path);
+        if (e != GECKO_OK) {
+            fprintf(stderr, "Warning: failed to export %s\n", vault->entries[i].name);
+        } else {
+            exported++;
+        }
+    }
+    
+    return exported > 0 ? GECKO_OK : GECKO_ERR_IO;
+}
+
+gecko_error_t gecko_vault_import(gecko_vault_t *vault, const char *src_dir, const char *prefix) {
+    if (!vault || !vault->open || !src_dir) return GECKO_ERR_INVALID_PARAM;
+    if (!gecko_dir_exists(src_dir)) return GECKO_ERR_FILE_NOT_FOUND;
+    
+    char **files = NULL;
+    uint32_t file_count = 0;
+    
+    gecko_error_t e = gecko_list_dir_recursive(src_dir, &files, &file_count);
+    if (e != GECKO_OK) return e;
+    
+    size_t src_len = strlen(src_dir);
+    uint32_t imported = 0;
+    
+    for (uint32_t i = 0; i < file_count; i++) {
+        /* Get relative path */
+        const char *rel = files[i] + src_len;
+        while (*rel == '/' || *rel == '\\') rel++;
+        
+        /* Build vault name with optional prefix */
+        char vault_name[GECKO_MAX_FILENAME];
+        if (prefix && *prefix) {
+            snprintf(vault_name, sizeof(vault_name), "%s/%s", prefix, rel);
+        } else {
+            strncpy(vault_name, rel, sizeof(vault_name) - 1);
+            vault_name[sizeof(vault_name) - 1] = '\0';
+        }
+        
+        /* Normalize path separators */
+        for (char *p = vault_name; *p; p++) {
+            if (*p == '\\') *p = '/';
+        }
+        
+        e = gecko_vault_add(vault, files[i], vault_name);
+        if (e == GECKO_OK) {
+            imported++;
+        } else if (e != GECKO_ERR_EXISTS) {
+            fprintf(stderr, "Warning: failed to import %s\n", files[i]);
+        }
+    }
+    
+    gecko_free_file_list(files, file_count);
+    return imported > 0 ? GECKO_OK : GECKO_ERR_IO;
+}
+
+gecko_error_t gecko_vault_compact(gecko_vault_t *vault) {
+    if (!vault || !vault->open) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Simply save the vault - this rewrites only active entries */
+    return gecko_vault_save(vault);
+}
+
+gecko_error_t gecko_vault_backup(gecko_vault_t *vault, const char *backup_dir,
+                                  char *backup_path, size_t path_len) {
+    if (!vault || !vault->open || !backup_dir) return GECKO_ERR_INVALID_PARAM;
+    
+    gecko_error_t e = gecko_mkdir_p(backup_dir);
+    if (e != GECKO_OK) return e;
+    
+    /* Generate timestamped filename */
+    char ts[32];
+    e = gecko_timestamp_string(ts, sizeof(ts));
+    if (e != GECKO_OK) return e;
+    
+    const char *base = gecko_basename(vault->path);
+    char dest[GECKO_MAX_PATH];
+    
+    /* Remove .gko extension if present */
+    char name[256];
+    strncpy(name, base, sizeof(name) - 1);
+    name[sizeof(name) - 1] = '\0';
+    char *dot = strrchr(name, '.');
+    if (dot && strcmp(dot, ".gko") == 0) *dot = '\0';
+    
+    snprintf(dest, sizeof(dest), "%s%c%s_%s.gko",
+             backup_dir, GECKO_PATH_SEP, name, ts);
+    
+    /* Read source vault file */
+    uint8_t *data = NULL;
+    size_t size = 0;
+    e = gecko_read_file(vault->path, &data, &size);
+    if (e != GECKO_OK) return e;
+    
+    /* Write to backup */
+    e = gecko_write_file(dest, data, size);
+    gecko_secure_zero(data, size);
+    free(data);
+    
+    if (e != GECKO_OK) return e;
+    
+    if (backup_path && path_len > 0) {
+        strncpy(backup_path, dest, path_len - 1);
+        backup_path[path_len - 1] = '\0';
+    }
+    
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_merge(gecko_vault_t *vault, const char *other_path,
+                                 const char *other_password) {
+    if (!vault || !vault->open || !other_path || !other_password)
+        return GECKO_ERR_INVALID_PARAM;
+    
+    gecko_vault_t *other = NULL;
+    gecko_error_t e = gecko_vault_open(other_path, other_password, &other);
+    if (e != GECKO_OK) return e;
+    
+    uint32_t merged = 0;
+    for (uint32_t i = 0; i < other->count; i++) {
+        /* Read data from other vault */
+        uint8_t *data = NULL;
+        size_t len = 0;
+        e = gecko_vault_read_data(other, other->entries[i].name, &data, &len);
+        if (e != GECKO_OK) continue;
+        
+        /* Add to this vault (skip if exists) */
+        e = gecko_vault_add_data(vault, other->entries[i].name, data, len);
+        gecko_secure_zero(data, len);
+        free(data);
+        
+        if (e == GECKO_OK) merged++;
+    }
+    
+    gecko_vault_close(other);
+    return merged > 0 ? GECKO_OK : GECKO_ERR_IO;
+}
+
+gecko_error_t gecko_vault_merge_with_keyfile(gecko_vault_t *vault, const char *other_path,
+                                              const char *other_password,
+                                              const char *other_keyfile) {
+    if (!vault || !vault->open || !other_path || !other_password || !other_keyfile)
+        return GECKO_ERR_INVALID_PARAM;
+    
+    gecko_vault_t *other = NULL;
+    gecko_error_t e = gecko_vault_open_with_keyfile(other_path, other_password, other_keyfile, &other);
+    if (e != GECKO_OK) return e;
+    
+    uint32_t merged = 0;
+    for (uint32_t i = 0; i < other->count; i++) {
+        /* Read data from other vault */
+        uint8_t *data = NULL;
+        size_t len = 0;
+        e = gecko_vault_read_data(other, other->entries[i].name, &data, &len);
+        if (e != GECKO_OK) continue;
+        
+        /* Add to this vault (skip if exists) */
+        e = gecko_vault_add_data(vault, other->entries[i].name, data, len);
+        gecko_secure_zero(data, len);
+        free(data);
+        
+        if (e == GECKO_OK) merged++;
+    }
+    
+    gecko_vault_close(other);
+    return merged > 0 ? GECKO_OK : GECKO_ERR_IO;
+}
+
+gecko_error_t gecko_vault_cat(gecko_vault_t *vault, const char *name) {
+    if (!vault || !vault->open || !name) return GECKO_ERR_INVALID_PARAM;
+    
+    uint8_t *data = NULL;
+    size_t len = 0;
+    gecko_error_t e = gecko_vault_read_data(vault, name, &data, &len);
+    if (e != GECKO_OK) return e;
+    
+    /* Write to stdout */
+    fwrite(data, 1, len, stdout);
+    fflush(stdout);
+    
+    gecko_secure_zero(data, len);
+    free(data);
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_generate_keyfile(const char *path) {
+    if (!path) return GECKO_ERR_INVALID_PARAM;
+    if (gecko_file_exists(path)) return GECKO_ERR_EXISTS;
+    
+    uint8_t keydata[64];  /* 512 bits of entropy */
+    gecko_error_t e = gecko_random_bytes(keydata, sizeof(keydata));
+    if (e != GECKO_OK) return e;
+    
+    e = gecko_write_file(path, keydata, sizeof(keydata));
+    gecko_secure_zero(keydata, sizeof(keydata));
+    return e;
+}
+
+gecko_error_t gecko_vault_create_with_keyfile(const char *path, const char *password,
+                                               const char *keyfile, gecko_vault_t **vault) {
+    if (!path || !password || !keyfile || !vault) return GECKO_ERR_INVALID_PARAM;
+    
+    uint8_t combined[64];
+    gecko_error_t e = gecko_combine_keyfile(password, keyfile, combined, sizeof(combined));
+    if (e != GECKO_OK) return e;
+    
+    /* Use combined key as password (hex encoded for compatibility) */
+    char hex_key[129];
+    e = gecko_bytes_to_hex(combined, sizeof(combined), hex_key, sizeof(hex_key));
+    gecko_secure_zero(combined, sizeof(combined));
+    if (e != GECKO_OK) return e;
+    
+    e = gecko_vault_create(path, hex_key, vault);
+    gecko_secure_zero(hex_key, sizeof(hex_key));
+    
+    if (e == GECKO_OK && *vault) {
+        (*vault)->hdr.flags |= 0x01;  /* Flag: uses keyfile */
+    }
+    
+    return e;
+}
+
+gecko_error_t gecko_vault_open_with_keyfile(const char *path, const char *password,
+                                             const char *keyfile, gecko_vault_t **vault) {
+    if (!path || !password || !keyfile || !vault) return GECKO_ERR_INVALID_PARAM;
+    
+    uint8_t combined[64];
+    gecko_error_t e = gecko_combine_keyfile(password, keyfile, combined, sizeof(combined));
+    if (e != GECKO_OK) return e;
+    
+    char hex_key[129];
+    e = gecko_bytes_to_hex(combined, sizeof(combined), hex_key, sizeof(hex_key));
+    gecko_secure_zero(combined, sizeof(combined));
+    if (e != GECKO_OK) return e;
+    
+    e = gecko_vault_open(path, hex_key, vault);
+    gecko_secure_zero(hex_key, sizeof(hex_key));
+    return e;
+}
+
+bool gecko_vault_uses_keyfile(gecko_vault_t *vault) {
+    if (!vault) return false;
+    return (vault->hdr.flags & 0x01) != 0;
+}
+
+gecko_error_t gecko_vault_enable_audit(gecko_vault_t *vault, const char *log_path) {
+    (void)vault;
+    (void)log_path;
+    /* Audit logging is handled at CLI level for simplicity */
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_audit_log(gecko_vault_t *vault, const char *action, const char *details) {
+    (void)vault;
+    (void)action;
+    (void)details;
+    /* Stub - actual logging done in CLI */
+    return GECKO_OK;
+}
