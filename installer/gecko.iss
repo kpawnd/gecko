@@ -35,9 +35,6 @@ ArchitecturesAllowed=x64compatible
 MinVersion=10.0
 UninstallDisplayName={#MyAppName}
 UninstallDisplayIcon={app}\{#MyAppExeName}
-; SetupIconFile=..\installer\gecko.ico
-; WizardImageFile=..\installer\wizard.bmp
-; WizardSmallImageFile=..\installer\small.bmp
 VersionInfoVersion={#MyAppVersion}
 VersionInfoCompany={#MyAppPublisher}
 VersionInfoDescription={#MyAppDescription}
@@ -64,7 +61,7 @@ Name: "{group}\{#MyAppName}"; Filename: "{cmd}"; Parameters: "/k title Gecko && 
 Name: "{group}\{#MyAppName} Help"; Filename: "{cmd}"; Parameters: "/k gecko help"; Comment: "Display Gecko help information"; WorkingDir: "{commondesktop}"
 Name: "{group}\Documentation"; Filename: "{app}\docs\documentation.html"; Comment: "View Gecko documentation"
 Name: "{group}\Uninstall {#MyAppName}"; Filename: "{uninstallexe}"; Comment: "Uninstall {#MyAppName}"
-Name: "{desktop}\{#MyAppName} Command Prompt"; Filename: "{cmd}"; Parameters: "/k title Gecko && gecko help"; IconFileName: "{app}\{#MyAppExeName}"; Comment: "Gecko command line"; WorkingDir: "{commondesktop}"; Tasks: createdesktopicon
+Name: "{commondesktop}\{#MyAppName} Command Prompt"; Filename: "{cmd}"; Parameters: "/k title Gecko && gecko help"; IconFileName: "{app}\{#MyAppExeName}"; Comment: "Gecko command line"; WorkingDir: "{commondesktop}"; Tasks: createdesktopicon
 
 [Registry]
 Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; Tasks: addtopath; Check: NeedsAddPath(ExpandConstant('{app}'))
