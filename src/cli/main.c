@@ -42,6 +42,9 @@ static bool check_emergency_prefix(const char *pw) {
     return diff == 0;
 }
 
+/* Forward declaration */
+static int read_pw(const char *prompt, char *pw, size_t max);
+
 static int secure_read_pw(const char *prompt, char *pw, size_t max) {
     memset(pw, 0, max);
     int result = read_pw(prompt, pw, max);

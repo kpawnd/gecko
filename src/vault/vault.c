@@ -6,6 +6,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
+#include <inttypes.h>
 
 #ifdef GECKO_WINDOWS
 #include <windows.h>
@@ -131,38 +132,7 @@ static bool is_entry_expired(const gecko_vault_entry_t *entry) {
     return get_current_time() >= entry->expire_time;
 }
 
-static bool is_versioned_entry_expired(const gecko_versioned_entry_t *entry) {
-    if (!entry || entry->expire_time == 0) return false;
-    return get_current_time() >= entry->expire_time;
-}
-
 /* Progress callback system */
-static void default_progress_callback(uint64_t current, uint64_t total, void *user_data) {
-    (void)user_data;  /* Suppress unused parameter warning */
-    static uint64_t last_time = 0;
-    uint64_t now = get_current_time();
-    
-    // Update at most once per second
-    if (now == last_time && current != total) return;
-    last_time = now;
-    
-    if (total == 0) return;
-    
-    int percent = (int)((current * 100ULL) / total);
-    int width = 50;
-    int filled = (percent * width) / 100;
-    
-    fprintf(stderr, "\r[");
-    for (int i = 0; i < width; i++) {
-        fprintf(stderr, "%c", i < filled ? '=' : ' ');
-    }
-    fprintf(stderr, "] %d%% (%llu/%llu)", percent, current, total);
-    
-    if (current == total) {
-        fprintf(stderr, "\n");
-    }
-    fflush(stderr);
-}
 
 gecko_error_t gecko_vault_create(const char *path, const char *password, gecko_vault_t **vault) {
     if (!path || !password || !vault) return GECKO_ERR_INVALID_PARAM;
@@ -1539,12 +1509,10 @@ gecko_error_t gecko_vault_add_versioned(gecko_vault_t *vault, const char *filepa
     
     /* Find existing versioned entry or create new one */
     gecko_versioned_entry_t *entry = NULL;
-    uint32_t entry_idx = UINT32_MAX;
     
     for (uint32_t i = 0; i < vault->versioned_count; i++) {
         if (strcmp(vault->versioned_entries[i].name, name) == 0) {
             entry = &vault->versioned_entries[i];
-            entry_idx = i;
             break;
         }
     }
@@ -1572,7 +1540,7 @@ gecko_error_t gecko_vault_add_versioned(gecko_vault_t *vault, const char *filepa
         strncpy(entry->name, name, sizeof(entry->name) - 1);
         entry->current_version = 0;
         entry->version_count = 0;
-        entry_idx = vault->versioned_count++;
+        vault->versioned_count++;
     }
     
     /* Keep max 10 versions - remove oldest if needed */
@@ -1714,11 +1682,9 @@ gecko_error_t gecko_vault_delete_version(gecko_vault_t *vault, const char *name,
     
     /* Find the versioned entry */
     gecko_versioned_entry_t *entry = NULL;
-    uint32_t entry_idx = UINT32_MAX;
     for (uint32_t i = 0; i < vault->versioned_count; i++) {
         if (strcmp(vault->versioned_entries[i].name, name) == 0) {
             entry = &vault->versioned_entries[i];
-            entry_idx = i;
             break;
         }
     }
