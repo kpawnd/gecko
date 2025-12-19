@@ -20,8 +20,18 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/wait.h>
+#include <limits.h>
+#include <fcntl.h>
 #define gecko_strdup strdup
 #endif
+
+/*
+ * Get current Unix timestamp
+ */
+uint64_t get_current_time(void) {
+    return (uint64_t)time(NULL);
+}
 
 /*
  * Secure memory wiping - resistant to compiler optimization
@@ -327,6 +337,102 @@ gecko_error_t gecko_write_file(const char *path, const uint8_t *data, size_t siz
 }
 
 /*
+ * Read file with progress callback
+ */
+gecko_error_t gecko_read_file_progress(const char *path, uint8_t **data, size_t *size,
+                                        void (*progress)(uint64_t current, uint64_t total, void *user_data),
+                                        void *user_data) {
+    if (!path || !data || !size) {
+        return GECKO_ERR_INVALID_PARAM;
+    }
+    
+    uint64_t file_size;
+    gecko_error_t err = gecko_file_size(path, &file_size);
+    if (err != GECKO_OK) return err;
+    
+    /* Check for reasonable size */
+    if (file_size > SIZE_MAX || file_size > 1024 * 1024 * 1024) {
+        return GECKO_ERR_INVALID_PARAM;
+    }
+    
+    FILE *f = fopen(path, "rb");
+    if (!f) return GECKO_ERR_FILE_NOT_FOUND;
+    
+    *data = (uint8_t *)malloc((size_t)file_size);
+    if (!*data) {
+        fclose(f);
+        return GECKO_ERR_NO_MEMORY;
+    }
+    
+    size_t total_read = 0;
+    size_t chunk_size = 64 * 1024;  // 64KB chunks
+    
+    while (total_read < (size_t)file_size) {
+        size_t to_read = chunk_size;
+        if (total_read + to_read > (size_t)file_size) {
+            to_read = (size_t)file_size - total_read;
+        }
+        
+        size_t read = fread(*data + total_read, 1, to_read, f);
+        if (read != to_read) {
+            free(*data);
+            *data = NULL;
+            fclose(f);
+            return GECKO_ERR_IO;
+        }
+        
+        total_read += read;
+        
+        if (progress) {
+            progress((uint64_t)total_read, file_size, user_data);
+        }
+    }
+    
+    fclose(f);
+    *size = (size_t)file_size;
+    return GECKO_OK;
+}
+
+/*
+ * Write file with progress callback
+ */
+gecko_error_t gecko_write_file_progress(const char *path, const uint8_t *data, size_t size,
+                                         void (*progress)(uint64_t current, uint64_t total, void *user_data),
+                                         void *user_data) {
+    if (!path || (!data && size > 0)) {
+        return GECKO_ERR_INVALID_PARAM;
+    }
+    
+    FILE *f = fopen(path, "wb");
+    if (!f) return GECKO_ERR_IO;
+    
+    size_t total_written = 0;
+    size_t chunk_size = 64 * 1024;  // 64KB chunks
+    
+    while (total_written < size) {
+        size_t to_write = chunk_size;
+        if (total_written + to_write > size) {
+            to_write = size - total_written;
+        }
+        
+        size_t written = fwrite(data + total_written, 1, to_write, f);
+        if (written != to_write) {
+            fclose(f);
+            return GECKO_ERR_IO;
+        }
+        
+        total_written += written;
+        
+        if (progress) {
+            progress((uint64_t)total_written, (uint64_t)size, user_data);
+        }
+    }
+    
+    fclose(f);
+    return GECKO_OK;
+}
+
+/*
  * Get filename from path
  */
 const char *gecko_basename(const char *path) {
@@ -480,7 +586,12 @@ gecko_error_t gecko_clipboard_get(char **text, size_t *len) {
         return GECKO_ERR_IO;
     }
     
-    size_t data_len = strlen(data);
+    /* Get clipboard data size from global handle */
+    size_t data_len = GlobalSize(h);
+    if (data_len > 0 && data[data_len - 1] == '\0') {
+        data_len--; /* Remove null terminator if present */
+    }
+    
     char *copy = malloc(data_len + 1);
     if (!copy) {
         GlobalUnlock(h);
@@ -488,7 +599,8 @@ gecko_error_t gecko_clipboard_get(char **text, size_t *len) {
         return GECKO_ERR_NO_MEMORY;
     }
     
-    memcpy(copy, data, data_len + 1);
+    memcpy(copy, data, data_len);
+    copy[data_len] = '\0';  /* Ensure null termination */
     GlobalUnlock(h);
     CloseClipboard();
     
@@ -533,14 +645,95 @@ gecko_error_t gecko_clipboard_set(const char *text, size_t len) {
 
 #else /* Linux */
 
+static int command_exists(const char *cmd) {
+    char path[PATH_MAX];
+    if (strchr(cmd, '/')) {
+        return access(cmd, X_OK) == 0;
+    }
+    char *path_env = getenv("PATH");
+    if (!path_env) return 0;
+    
+    char *path_copy = strdup(path_env);
+    if (!path_copy) return 0;
+    
+    int found = 0;
+    char *dir = strtok(path_copy, ":");
+    while (dir) {
+        snprintf(path, sizeof(path), "%s/%s", dir, cmd);
+        if (access(path, X_OK) == 0) {
+            found = 1;
+            break;
+        }
+        dir = strtok(NULL, ":");
+    }
+    free(path_copy);
+    return found;
+}
+
+static FILE *safe_popen(const char *cmd, const char *mode) {
+    if (!cmd || !mode) return NULL;
+    
+    // Split command into arguments safely
+    char *cmd_copy = strdup(cmd);
+    if (!cmd_copy) return NULL;
+    
+    char *args[4] = {NULL}; // Max 3 args + NULL
+    int arg_count = 0;
+    
+    char *token = strtok(cmd_copy, " ");
+    while (token && arg_count < 3) {
+        args[arg_count++] = token;
+        token = strtok(NULL, " ");
+    }
+    
+    if (arg_count == 0) {
+        free(cmd_copy);
+        return NULL;
+    }
+    
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        free(cmd_copy);
+        return NULL;
+    }
+    
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        free(cmd_copy);
+        return NULL;
+    }
+    
+    if (pid == 0) { // Child
+        close(pipefd[strcmp(mode, "r") == 0 ? 0 : 1]);
+        dup2(pipefd[strcmp(mode, "r") == 0 ? 1 : 0], strcmp(mode, "r") == 0 ? 1 : 0);
+        close(pipefd[strcmp(mode, "r") == 0 ? 1 : 0]);
+        
+        execvp(args[0], args);
+        _exit(127); // Command not found
+    } else { // Parent
+        close(pipefd[strcmp(mode, "r") == 0 ? 1 : 0]);
+        free(cmd_copy);
+        return fdopen(pipefd[strcmp(mode, "r") == 0 ? 0 : 1], mode);
+    }
+}
+
 gecko_error_t gecko_clipboard_get(char **text, size_t *len) {
     if (!text || !len) return GECKO_ERR_INVALID_PARAM;
     
     *text = NULL;
     *len = 0;
     
-    /* Try xclip first, then xsel */
-    FILE *p = popen("xclip -selection clipboard -o 2>/dev/null || xsel -b -o 2>/dev/null", "r");
+    FILE *p = NULL;
+    
+    /* Try xclip first, then xsel - check availability first */
+    if (command_exists("xclip")) {
+        p = safe_popen("xclip -selection clipboard -o", "r");
+    } else if (command_exists("xsel")) {
+        p = safe_popen("xsel -b -o", "r");
+    }
+    
     if (!p) return GECKO_ERR_IO;
     
     size_t capacity = 4096;
@@ -577,8 +770,15 @@ gecko_error_t gecko_clipboard_set(const char *text, size_t len) {
     if (!text) return GECKO_ERR_INVALID_PARAM;
     if (len == 0) len = strlen(text);
     
-    /* Try xclip first, then xsel */
-    FILE *p = popen("xclip -selection clipboard 2>/dev/null || xsel -b -i 2>/dev/null", "w");
+    FILE *p = NULL;
+    
+    /* Try xclip first, then xsel - check availability first */
+    if (command_exists("xclip")) {
+        p = safe_popen("xclip -selection clipboard", "w");
+    } else if (command_exists("xsel")) {
+        p = safe_popen("xsel -b -i", "w");
+    }
+    
     if (!p) return GECKO_ERR_IO;
     
     size_t written = fwrite(text, 1, len, p);

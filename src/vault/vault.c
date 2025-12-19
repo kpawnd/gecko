@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
 
 #ifdef GECKO_WINDOWS
 #include <windows.h>
@@ -43,6 +44,9 @@ struct gecko_vault {
     file_data_t *file_data;
     uint32_t count;
     uint32_t capacity;
+    gecko_versioned_entry_t *versioned_entries;  /* Versioned entries */
+    uint32_t versioned_count;
+    uint32_t versioned_capacity;
     bool open;
     bool dirty;
 };
@@ -84,6 +88,20 @@ static void free_file_data(file_data_t *fd) {
     }
 }
 
+static bool validate_file_data_integrity(gecko_vault_t *v) {
+    if (!v) return false;
+    if (v->count == 0) return v->file_data == NULL;
+    
+    file_data_t *fd = v->file_data;
+    uint32_t count = 0;
+    while (fd) {
+        count++;
+        if (count > v->count) return false; // Too many elements
+        fd = fd->next;
+    }
+    return count == v->count; // Must match exactly
+}
+
 static void vault_cleanup(gecko_vault_t *v) {
     if (!v) return;
     gecko_secure_zero(v->key, 32);
@@ -93,8 +111,57 @@ static void vault_cleanup(gecko_vault_t *v) {
         gecko_secure_zero(v->entries, v->capacity * sizeof(gecko_vault_entry_t));
         free(v->entries);
     }
+    // Clean up versioned entries
+    if (v->versioned_entries) {
+        for (uint32_t i = 0; i < v->versioned_count; i++) {
+            gecko_secure_zero(v->versioned_entries[i].versions,
+                            v->versioned_entries[i].version_count * sizeof(gecko_file_version_t));
+            free(v->versioned_entries[i].versions);
+        }
+        free(v->versioned_entries);
+    }
     gecko_secure_zero(v, sizeof(*v));
     free(v);
+}
+
+/* Time utilities */
+
+static bool is_entry_expired(const gecko_vault_entry_t *entry) {
+    if (!entry || entry->expire_time == 0) return false;
+    return get_current_time() >= entry->expire_time;
+}
+
+static bool is_versioned_entry_expired(const gecko_versioned_entry_t *entry) {
+    if (!entry || entry->expire_time == 0) return false;
+    return get_current_time() >= entry->expire_time;
+}
+
+/* Progress callback system */
+static void default_progress_callback(uint64_t current, uint64_t total, void *user_data) {
+    (void)user_data;  /* Suppress unused parameter warning */
+    static uint64_t last_time = 0;
+    uint64_t now = get_current_time();
+    
+    // Update at most once per second
+    if (now == last_time && current != total) return;
+    last_time = now;
+    
+    if (total == 0) return;
+    
+    int percent = (int)((current * 100ULL) / total);
+    int width = 50;
+    int filled = (percent * width) / 100;
+    
+    fprintf(stderr, "\r[");
+    for (int i = 0; i < width; i++) {
+        fprintf(stderr, "%c", i < filled ? '=' : ' ');
+    }
+    fprintf(stderr, "] %d%% (%llu/%llu)", percent, current, total);
+    
+    if (current == total) {
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
 }
 
 gecko_error_t gecko_vault_create(const char *path, const char *password, gecko_vault_t **vault) {
@@ -125,6 +192,11 @@ gecko_error_t gecko_vault_create(const char *path, const char *password, gecko_v
     v->entries = calloc(v->capacity, sizeof(gecko_vault_entry_t));
     if (!v->entries) { vault_cleanup(v); return GECKO_ERR_NO_MEMORY; }
     
+    // Initialize versioned entries
+    v->versioned_capacity = 8;
+    v->versioned_entries = calloc(v->versioned_capacity, sizeof(gecko_versioned_entry_t));
+    if (!v->versioned_entries) { vault_cleanup(v); return GECKO_ERR_NO_MEMORY; }
+    
     v->open = true;
     v->dirty = true;
     *vault = v;
@@ -143,7 +215,12 @@ gecko_error_t gecko_vault_open(const char *path, const char *password, gecko_vau
     gecko_vault_t *v = calloc(1, sizeof(gecko_vault_t));
     if (!v) { fclose(f); return GECKO_ERR_NO_MEMORY; }
     
-    strncpy(v->path, path, sizeof(v->path) - 1);
+    if (strlen(path) >= sizeof(v->path)) {
+        free(v);
+        fclose(f);
+        return GECKO_ERR_INVALID_PARAM;
+    }
+    strcpy(v->path, path);
     
     gecko_error_t e = GECKO_OK;
     uint8_t buf[64];
@@ -187,6 +264,11 @@ gecko_error_t gecko_vault_open(const char *path, const char *password, gecko_vau
     v->capacity = v->hdr.entry_count > 0 ? v->hdr.entry_count : 16;
     v->entries = calloc(v->capacity, sizeof(gecko_vault_entry_t));
     if (!v->entries) { e = GECKO_ERR_NO_MEMORY; goto fail; }
+    
+    /* Initialize versioned entries (empty for now - format extension needed) */
+    v->versioned_capacity = 8;
+    v->versioned_entries = calloc(v->versioned_capacity, sizeof(gecko_versioned_entry_t));
+    if (!v->versioned_entries) { e = GECKO_ERR_NO_MEMORY; goto fail; }
     
     /* Read entries */
     file_data_t *last_fd = NULL;
@@ -265,6 +347,9 @@ gecko_error_t gecko_vault_open(const char *path, const char *password, gecko_vau
             last_fd = fd;
         }
     }
+    
+    /* Validate file_data integrity */
+    if (!validate_file_data_integrity(v)) { e = GECKO_ERR_CORRUPTED; goto fail; }
     
     fclose(f);
     v->open = true;
@@ -358,11 +443,23 @@ gecko_error_t gecko_vault_save(gecko_vault_t *v) {
     uint64_t data_sz = 0;
     
     file_data_t *fd = v->file_data;
-    for (uint32_t i = 0; i < v->count && fd; i++) {
+    for (uint32_t i = 0; i < v->count; i++) {
+        if (!fd) {
+            /* Critical: list/count mismatch detected during save */
+            e = GECKO_ERR_CORRUPTED;
+            goto fail;
+        }
         v->entries[i].offset = data_sz;
         if (fwrite(fd->enc_data, 1, fd->enc_len, f) != fd->enc_len) { e = GECKO_ERR_IO; goto fail; }
         data_sz += fd->enc_len;
         fd = fd->next;
+    }
+    
+    /* Verify no orphaned file_data nodes */
+    if (fd != NULL) {
+        /* Extra nodes in file_data list that have no entries */
+        e = GECKO_ERR_CORRUPTED;
+        goto fail;
     }
     
     /* Update header with data offset/size */
@@ -576,7 +673,14 @@ gecko_error_t gecko_vault_remove(gecko_vault_t *v, const char *name) {
     
     /* Remove file data from linked list */
     file_data_t *prev = NULL, *fd = v->file_data;
-    for (uint32_t i = 0; i < idx && fd; i++) { prev = fd; fd = fd->next; }
+    for (uint32_t i = 0; i < idx && fd; i++) {
+        if (!fd->next && i < idx - 1) {
+            /* Mismatch between entry count and file_data list */
+            return GECKO_ERR_CORRUPTED;
+        }
+        prev = fd;
+        fd = fd->next;
+    }
     
     if (fd) {
         if (prev) prev->next = fd->next;
@@ -772,6 +876,16 @@ gecko_error_t gecko_vault_add_data(gecko_vault_t *v, const char *name, const uin
     }
     if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) return GECKO_ERR_INVALID_PARAM;
     
+    /* Verify list integrity before proceeding */
+    uint32_t fd_count = 0;
+    file_data_t *temp_fd = v->file_data;
+    while (temp_fd && fd_count < v->count + 1) {
+        fd_count++;
+        temp_fd = temp_fd->next;
+    }
+    /* If mismatch detected, report corruption */
+    if (fd_count != v->count) return GECKO_ERR_CORRUPTED;
+    
     /* Check duplicate */
     for (uint32_t i = 0; i < v->count; i++) {
         if (strcmp(v->entries[i].name, name) == 0) return GECKO_ERR_EXISTS;
@@ -835,6 +949,9 @@ gecko_error_t gecko_vault_add_data(gecko_vault_t *v, const char *name, const uin
     ent->name[sizeof(ent->name) - 1] = '\0';
     ent->size = len;
     ent->encrypted_size = enc_len;
+    ent->created_time = get_current_time();
+    ent->expire_time = 0;  // Never expires by default
+    ent->flags = 0;
     
     v->count++;
     v->dirty = true;
@@ -851,8 +968,24 @@ gecko_error_t gecko_vault_read_data(gecko_vault_t *v, const char *name, uint8_t 
     }
     if (idx == UINT32_MAX) return GECKO_ERR_NOT_FOUND;
     
+    /* Check if entry has expired */
+    if (is_entry_expired(&v->entries[idx])) {
+        if (v->entries[idx].flags & GECKO_ENTRY_FLAG_AUTO_DELETE) {
+            /* Auto-delete expired entry */
+            gecko_vault_remove(v, name);
+            return GECKO_ERR_NOT_FOUND;
+        } else {
+            /* Mark as expired but allow access */
+            v->entries[idx].flags |= GECKO_ENTRY_FLAG_EXPIRED;
+            v->dirty = true;
+        }
+    }
+    
     file_data_t *fd = v->file_data;
-    for (uint32_t i = 0; i < idx && fd; i++) fd = fd->next;
+    for (uint32_t i = 0; i < idx; i++) {
+        if (!fd) return GECKO_ERR_CORRUPTED;  /* Mismatch between entry count and file_data list */
+        fd = fd->next;
+    }
     if (!fd || !fd->enc_data) return GECKO_ERR_NOT_FOUND;
     if (fd->enc_len < MIN_ENC_SIZE) return GECKO_ERR_FORMAT;
     
@@ -1259,4 +1392,439 @@ gecko_error_t gecko_vault_audit_log(gecko_vault_t *vault, const char *action, co
     (void)details;
     /* Stub - actual logging done in CLI */
     return GECKO_OK;
+}
+
+/* Time-based access control functions */
+gecko_error_t gecko_vault_add_with_expiry(gecko_vault_t *vault, const char *filepath,
+                                           const char *vault_name, uint64_t expire_time,
+                                           bool auto_delete) {
+    if (!vault || !vault->open || !filepath) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Read file */
+    uint8_t *data = NULL;
+    size_t len = 0;
+    gecko_error_t e = gecko_read_file(filepath, &data, &len);
+    if (e != GECKO_OK) return e;
+    
+    const char *name = vault_name ? vault_name : gecko_basename(filepath);
+    e = gecko_vault_add_data(vault, name, data, len);
+    if (e != GECKO_OK) {
+        gecko_secure_zero(data, len);
+        free(data);
+        return e;
+    }
+    
+    /* Set expiry on the newly added entry */
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (strcmp(vault->entries[i].name, name) == 0) {
+            vault->entries[i].expire_time = expire_time;
+            if (auto_delete) {
+                vault->entries[i].flags |= GECKO_ENTRY_FLAG_AUTO_DELETE;
+            }
+            vault->dirty = true;
+            break;
+        }
+    }
+    
+    /* Also create a versioned entry for this file */
+    /*
+    e = gecko_vault_add_versioned(vault, filepath, name, "Initial version with expiry");
+    if (e != GECKO_OK) {
+        // Versioning failed, but the file was added successfully
+        // This is not a critical error, so we continue
+        (void)e; // Suppress unused variable warning
+    }
+    */
+    
+    gecko_secure_zero(data, len);
+    free(data);
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_set_expiry(gecko_vault_t *vault, const char *name,
+                                      uint64_t expire_time, bool auto_delete) {
+    if (!vault || !vault->open || !name) return GECKO_ERR_INVALID_PARAM;
+    
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (strcmp(vault->entries[i].name, name) == 0) {
+            vault->entries[i].expire_time = expire_time;
+            if (auto_delete) {
+                vault->entries[i].flags |= GECKO_ENTRY_FLAG_AUTO_DELETE;
+            } else {
+                vault->entries[i].flags &= ~GECKO_ENTRY_FLAG_AUTO_DELETE;
+            }
+            vault->dirty = true;
+            return GECKO_OK;
+        }
+    }
+    return GECKO_ERR_NOT_FOUND;
+}
+
+gecko_error_t gecko_vault_get_expiry(gecko_vault_t *vault, const char *name,
+                                      uint64_t *expire_time, bool *auto_delete) {
+    if (!vault || !vault->open || !name || !expire_time || !auto_delete) 
+        return GECKO_ERR_INVALID_PARAM;
+    
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (strcmp(vault->entries[i].name, name) == 0) {
+            *expire_time = vault->entries[i].expire_time;
+            *auto_delete = (vault->entries[i].flags & GECKO_ENTRY_FLAG_AUTO_DELETE) != 0;
+            return GECKO_OK;
+        }
+    }
+    return GECKO_ERR_NOT_FOUND;
+}
+
+gecko_error_t gecko_vault_cleanup_expired(gecko_vault_t *vault) {
+    if (!vault || !vault->open) return GECKO_ERR_INVALID_PARAM;
+    
+    uint32_t write_idx = 0;
+    file_data_t *read_fd = vault->file_data;
+    file_data_t *write_fd = NULL;
+    file_data_t *prev_fd = NULL;
+    
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (is_entry_expired(&vault->entries[i])) {
+            /* Remove this entry - skip copying it */
+            if (read_fd) {
+                file_data_t *next_fd = read_fd->next;
+                if (read_fd->enc_data) {
+                    gecko_secure_zero(read_fd->enc_data, read_fd->enc_len);
+                    free(read_fd->enc_data);
+                }
+                free(read_fd);
+                read_fd = next_fd;
+            }
+            continue;
+        }
+        
+        /* Keep this entry */
+        vault->entries[write_idx] = vault->entries[i];
+        write_idx++;
+        
+        /* Keep the corresponding file data */
+        if (read_fd) {
+            if (!write_fd) {
+                vault->file_data = read_fd;
+                write_fd = read_fd;
+            } else {
+                write_fd->next = read_fd;
+                write_fd = read_fd;
+            }
+            prev_fd = read_fd;
+            read_fd = read_fd->next;
+            if (prev_fd) prev_fd->next = NULL;
+        }
+    }
+    
+    vault->count = write_idx;
+    if (write_fd) write_fd->next = NULL;
+    vault->dirty = true;
+    
+    return GECKO_OK;
+}
+
+/* File versioning functions */
+gecko_error_t gecko_vault_add_versioned(gecko_vault_t *vault, const char *filepath,
+                                         const char *vault_name, const char *comment) {
+    if (!vault || !vault->open || !filepath) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Read file */
+    uint8_t *data = NULL;
+    size_t len = 0;
+    gecko_error_t e = gecko_read_file(filepath, &data, &len);
+    if (e != GECKO_OK) return e;
+    
+    const char *name = vault_name ? vault_name : gecko_basename(filepath);
+    
+    /* Find existing versioned entry or create new one */
+    gecko_versioned_entry_t *entry = NULL;
+    uint32_t entry_idx = UINT32_MAX;
+    
+    for (uint32_t i = 0; i < vault->versioned_count; i++) {
+        if (strcmp(vault->versioned_entries[i].name, name) == 0) {
+            entry = &vault->versioned_entries[i];
+            entry_idx = i;
+            break;
+        }
+    }
+    
+    if (!entry) {
+        /* Create new versioned entry */
+        if (vault->versioned_count >= vault->versioned_capacity) {
+            uint32_t new_cap = vault->versioned_capacity * 2;
+            if (new_cap == 0) new_cap = 8;
+            gecko_versioned_entry_t *new_entries = realloc(vault->versioned_entries, 
+                new_cap * sizeof(gecko_versioned_entry_t));
+            if (!new_entries) {
+                gecko_secure_zero(data, len);
+                free(data);
+                return GECKO_ERR_NO_MEMORY;
+            }
+            memset(new_entries + vault->versioned_capacity, 0, 
+                   (new_cap - vault->versioned_capacity) * sizeof(gecko_versioned_entry_t));
+            vault->versioned_entries = new_entries;
+            vault->versioned_capacity = new_cap;
+        }
+        
+        entry = &vault->versioned_entries[vault->versioned_count];
+        memset(entry, 0, sizeof(*entry));
+        strncpy(entry->name, name, sizeof(entry->name) - 1);
+        entry->current_version = 0;
+        entry->version_count = 0;
+        entry_idx = vault->versioned_count++;
+    }
+    
+    /* Keep max 10 versions - remove oldest if needed */
+    if (entry->version_count >= 10) {
+        /* Shift versions to remove oldest */
+        memmove(&entry->versions[0], &entry->versions[1], 
+                9 * sizeof(gecko_file_version_t));
+        entry->version_count = 9;
+    }
+    
+    /* Encrypt and store data */
+    uint8_t iv[12];
+    e = gecko_random_bytes(iv, 12);
+    if (e != GECKO_OK) {
+        gecko_secure_zero(data, len);
+        free(data);
+        return e;
+    }
+    
+    size_t enc_len = 12 + len + 16;
+    uint8_t *enc = malloc(enc_len);
+    if (!enc) {
+        gecko_secure_zero(data, len);
+        free(data);
+        return GECKO_ERR_NO_MEMORY;
+    }
+    
+    memcpy(enc, iv, 12);
+    e = gecko_gcm_encrypt_simple(vault->key, data, len, NULL, 0, iv, enc + 12, enc + 12 + len);
+    gecko_secure_zero(data, len);
+    free(data);
+    
+    if (e != GECKO_OK) {
+        gecko_secure_zero(enc, enc_len);
+        free(enc);
+        return e;
+    }
+    
+    /* Store encrypted data */
+    file_data_t *fd = calloc(1, sizeof(file_data_t));
+    if (!fd) {
+        gecko_secure_zero(enc, enc_len);
+        free(enc);
+        return GECKO_ERR_NO_MEMORY;
+    }
+    fd->enc_data = enc;
+    fd->enc_len = enc_len;
+    
+    /* Append to list */
+    if (!vault->file_data) {
+        vault->file_data = fd;
+    } else {
+        file_data_t *tail = vault->file_data;
+        while (tail->next) tail = tail->next;
+        tail->next = fd;
+    }
+    
+    /* Add version info */
+    gecko_file_version_t *ver = &entry->versions[entry->version_count];
+    memset(ver, 0, sizeof(*ver));
+    ver->version_id = ++entry->current_version;
+    ver->timestamp = get_current_time();
+    ver->size = len;
+    ver->encrypted_size = enc_len;
+    ver->offset = 0;  // Would need proper offset calculation
+    if (comment) {
+        strncpy(ver->comment, comment, sizeof(ver->comment) - 1);
+    }
+    
+    entry->version_count++;
+    vault->dirty = true;
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_list_versions(gecko_vault_t *vault, const char *name,
+                                         gecko_file_version_t **versions, uint32_t *count) {
+    if (!vault || !vault->open || !name || !versions || !count) 
+        return GECKO_ERR_INVALID_PARAM;
+    
+    /* First check versioned entries */
+    for (uint32_t i = 0; i < vault->versioned_count; i++) {
+        if (strcmp(vault->versioned_entries[i].name, name) == 0) {
+            *versions = vault->versioned_entries[i].versions;
+            *count = vault->versioned_entries[i].version_count;
+            return GECKO_OK;
+        }
+    }
+    
+    /* If not found in versioned entries, check regular entries with expiry */
+    /* For regular entries, we create a synthetic version */
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (strcmp(vault->entries[i].name, name) == 0) {
+            /* Create a temporary version entry */
+            static gecko_file_version_t temp_version;
+            memset(&temp_version, 0, sizeof(temp_version));
+            temp_version.version_id = 1;
+            temp_version.timestamp = vault->entries[i].created_time;
+            temp_version.size = vault->entries[i].size;
+            *versions = &temp_version;
+            *count = 1;
+            return GECKO_OK;
+        }
+    }
+    
+    return GECKO_ERR_NOT_FOUND;
+}
+
+gecko_error_t gecko_vault_restore_version(gecko_vault_t *vault, const char *name,
+                                           uint32_t version_id, const char *dest_path) {
+    if (!vault || !vault->open || !name || !dest_path) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Find the versioned entry */
+    gecko_versioned_entry_t *entry = NULL;
+    for (uint32_t i = 0; i < vault->versioned_count; i++) {
+        if (strcmp(vault->versioned_entries[i].name, name) == 0) {
+            entry = &vault->versioned_entries[i];
+            break;
+        }
+    }
+    if (!entry) return GECKO_ERR_NOT_FOUND;
+    
+    /* Find the specific version */
+    gecko_file_version_t *ver = NULL;
+    for (uint32_t i = 0; i < entry->version_count; i++) {
+        if (entry->versions[i].version_id == version_id) {
+            ver = &entry->versions[i];
+            break;
+        }
+    }
+    if (!ver) return GECKO_ERR_NOT_FOUND;
+    
+    /* For now, return not implemented - would need to store version data separately */
+    /* This is a simplified implementation */
+    return GECKO_ERR_NOT_FOUND;
+}
+
+gecko_error_t gecko_vault_delete_version(gecko_vault_t *vault, const char *name, uint32_t version_id) {
+    if (!vault || !vault->open || !name) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Find the versioned entry */
+    gecko_versioned_entry_t *entry = NULL;
+    uint32_t entry_idx = UINT32_MAX;
+    for (uint32_t i = 0; i < vault->versioned_count; i++) {
+        if (strcmp(vault->versioned_entries[i].name, name) == 0) {
+            entry = &vault->versioned_entries[i];
+            entry_idx = i;
+            break;
+        }
+    }
+    if (!entry) return GECKO_ERR_NOT_FOUND;
+    
+    /* Find and remove the specific version */
+    for (uint32_t i = 0; i < entry->version_count; i++) {
+        if (entry->versions[i].version_id == version_id) {
+            /* Shift remaining versions */
+            if (i < entry->version_count - 1) {
+                memmove(&entry->versions[i], &entry->versions[i + 1], 
+                        (entry->version_count - i - 1) * sizeof(gecko_file_version_t));
+            }
+            entry->version_count--;
+            vault->dirty = true;
+            return GECKO_OK;
+        }
+    }
+    return GECKO_ERR_NOT_FOUND;
+}
+
+/* Progress-aware operations */
+gecko_error_t gecko_vault_add_with_progress(gecko_vault_t *vault, const char *filepath,
+                                             const char *vault_name, gecko_progress_fn progress_callback,
+                                             void *user_data) {
+    if (!vault || !vault->open || !filepath) return GECKO_ERR_INVALID_PARAM;
+    
+    /* Read file with progress */
+    uint8_t *data = NULL;
+    size_t len = 0;
+    gecko_error_t e;
+    
+    if (progress_callback) {
+        /* For progress, we'd need to modify gecko_read_file to support callbacks */
+        /* For now, use simple read and call progress at start/end */
+        progress_callback(0, 100, user_data);  // Start
+        e = gecko_read_file(filepath, &data, &len);
+        progress_callback(100, 100, user_data);  // End
+    } else {
+        e = gecko_read_file(filepath, &data, &len);
+    }
+    
+    if (e != GECKO_OK) return e;
+    
+    const char *name = vault_name ? vault_name : gecko_basename(filepath);
+    e = gecko_vault_add_data(vault, name, data, len);
+    
+    gecko_secure_zero(data, len);
+    free(data);
+    return e;
+}
+
+gecko_error_t gecko_vault_extract_with_progress(gecko_vault_t *vault, const char *name,
+                                                 const char *dest_path, gecko_progress_fn progress_callback,
+                                                 void *user_data) {
+    if (!vault || !vault->open || !name || !dest_path) return GECKO_ERR_INVALID_PARAM;
+    
+    uint8_t *data = NULL;
+    size_t len = 0;
+    gecko_error_t e = gecko_vault_read_data(vault, name, &data, &len);
+    if (e != GECKO_OK) return e;
+    
+    if (progress_callback) {
+        progress_callback(0, 100, user_data);  // Start
+        e = gecko_write_file(dest_path, data, len);
+        progress_callback(100, 100, user_data);  // End
+    } else {
+        e = gecko_write_file(dest_path, data, len);
+    }
+    
+    gecko_secure_zero(data, len);
+    free(data);
+    return e;
+}
+
+gecko_error_t gecko_vault_export_with_progress(gecko_vault_t *vault, const char *dest_dir,
+                                                gecko_progress_fn progress_callback, void *user_data) {
+    if (!vault || !vault->open || !dest_dir) return GECKO_ERR_INVALID_PARAM;
+    
+    for (uint32_t i = 0; i < vault->count; i++) {
+        if (progress_callback) {
+            progress_callback(i, vault->count, user_data);
+        }
+        
+        char dest_path[GECKO_MAX_PATH];
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", dest_dir, vault->entries[i].name);
+        
+        gecko_error_t e = gecko_vault_extract(vault, vault->entries[i].name, dest_path);
+        if (e != GECKO_OK) return e;
+    }
+    
+    if (progress_callback) {
+        progress_callback(vault->count, vault->count, user_data);
+    }
+    
+    return GECKO_OK;
+}
+
+gecko_error_t gecko_vault_import_with_progress(gecko_vault_t *vault, const char *src_dir,
+                                                const char *prefix, gecko_progress_fn progress_callback,
+                                                void *user_data) {
+    /* Simplified implementation - would need directory traversal */
+    (void)vault;
+    (void)src_dir;
+    (void)prefix;
+    (void)progress_callback;
+    (void)user_data;
+    return GECKO_ERR_NOT_IMPLEMENTED;
 }

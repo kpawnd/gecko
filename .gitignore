@@ -13,6 +13,14 @@ cmake-build-*/
 # Tests
 tests/
 
+# Text files
+*.txt
+*.md
+*.rst
+
+# Build for installer
+installer/output
+
 # IDE
 .vs/
 .vscode/

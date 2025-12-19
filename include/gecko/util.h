@@ -35,6 +35,19 @@ gecko_error_t gecko_read_file(const char *path, uint8_t **data, size_t *size);
 /* Write data to file */
 gecko_error_t gecko_write_file(const char *path, const uint8_t *data, size_t size);
 
+/* Read file with progress callback */
+gecko_error_t gecko_read_file_progress(const char *path, uint8_t **data, size_t *size,
+                                        void (*progress)(uint64_t current, uint64_t total, void *user_data),
+                                        void *user_data);
+
+/* Write file with progress callback */
+gecko_error_t gecko_write_file_progress(const char *path, const uint8_t *data, size_t size,
+                                         void (*progress)(uint64_t current, uint64_t total, void *user_data),
+                                         void *user_data);
+
+/* Get current Unix timestamp */
+uint64_t get_current_time(void);
+
 /* Get filename from path */
 const char *gecko_basename(const char *path);
 

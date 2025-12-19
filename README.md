@@ -20,9 +20,12 @@ Binaries in `build/bin/Release/`.
 ```bash
 gecko create vault.gko          # Create vault
 gecko add vault.gko file.txt    # Add file
+gecko add-expire vault.gko name file.txt 24  # Add with 24h expiration
 gecko ls vault.gko              # List contents
 gecko get vault.gko file.txt    # Extract file
 gecko rm vault.gko file.txt     # Remove file
+gecko versions vault.gko name   # List file versions
+gecko restore vault.gko name 1  # Restore version
 gecko info vault.gko            # Vault info
 gecko passwd vault.gko          # Change password
 

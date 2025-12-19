@@ -42,6 +42,15 @@ static bool check_emergency_prefix(const char *pw) {
     return diff == 0;
 }
 
+static int secure_read_pw(const char *prompt, char *pw, size_t max) {
+    memset(pw, 0, max);
+    int result = read_pw(prompt, pw, max);
+    if (result < 0) {
+        gecko_secure_zero(pw, max);
+    }
+    return result;
+}
+
 static int read_pw(const char *prompt, char *pw, size_t max) {
     if (!pw || max < MIN_PW + 1) return -1;
     memset(pw, 0, max);
@@ -162,10 +171,14 @@ static void usage(void) {
     printf("  create <vault>              Create new vault\n");
     printf("  create <vault> -k <keyfile> Create vault with keyfile (2FA)\n");
     printf("  add <vault> <file> [name]   Add file to vault\n");
+    printf("  add-expire <vault> <name> <file> <hours> [--auto-delete]\n");
+    printf("                             Add file with expiration time\n");
     printf("  get <vault> <name> [dest]   Extract file from vault\n");
     printf("  ls <vault>                  List vault contents\n");
     printf("  rm <vault> <name>           Remove file from vault\n");
     printf("  cat <vault> <name>          Print file contents to stdout\n");
+    printf("  versions <vault> <name>     List file versions\n");
+    printf("  restore <vault> <name> <v>  Restore specific file version\n");
     printf("  info <vault>                Show vault info\n");
     printf("  passwd <vault>              Change vault password\n");
     printf("  verify <vault>              Verify vault integrity\n\n");
@@ -311,7 +324,7 @@ static int cmd_get(int argc, char **argv) {
     
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
-    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    if (secure_read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
     gecko_error_t e;
@@ -328,7 +341,9 @@ static int cmd_get(int argc, char **argv) {
     memset(dest, 0, sizeof(dest));
     int n;
     if (new_argc > 2) {
-        if (strstr(argv[2], "..") != NULL) {
+        /* Strict path validation: reject .., /, absolute paths */
+        if (strstr(argv[2], "..") != NULL || argv[2][0] == '/' || argv[2][0] == '\\' || 
+            (strlen(argv[2]) > 1 && argv[2][1] == ':')) {
             fprintf(stderr, "Error: invalid path\n");
             gecko_vault_close(v);
             return 1;
@@ -362,7 +377,7 @@ static int cmd_ls(int argc, char **argv) {
     
     char pw[MAX_PW];
     memset(pw, 0, sizeof(pw));
-    if (read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    if (secure_read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
     
     gecko_vault_t *v = NULL;
     gecko_error_t e;
@@ -1138,8 +1153,150 @@ static int cmd_keygen(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_add_expire(int argc, char **argv) {
+    if (argc < 4) { 
+        fprintf(stderr, "Usage: gecko add-expire <vault> <name> <file> <hours> [--auto-delete]\n"); 
+        return 1; 
+    }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 4) { 
+        fprintf(stderr, "Usage: gecko add-expire <vault> <name> <file> <hours> [--auto-delete]\n"); 
+        return 1; 
+    }
+    
+    char *vault_path = argv[0];
+    char *name = argv[1];
+    char *file_path = argv[2];
+    int hours = atoi(argv[3]);
+    int auto_delete = 0;
+    
+    // Check for --auto-delete flag
+    if (new_argc > 4 && !strcmp(argv[4], "--auto-delete")) {
+        auto_delete = 1;
+    }
+    
+    if (hours <= 0) {
+        fprintf(stderr, "Error: hours must be a positive integer\n");
+        return 1;
+    }
+    
+    char pw[MAX_PW];
+    if (secure_read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(vault_path, pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(vault_path, pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    // Calculate expiration time
+    time_t expire_time = get_current_time() + (hours * 3600);
+    
+    e = gecko_vault_add_with_expiry(v, file_path, name, expire_time, auto_delete);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to add file with expiry\n"); return 1; }
+    
+    printf("File added with %d hour expiration", hours);
+    if (auto_delete) printf(" (auto-delete enabled)");
+    printf("\n");
+    return 0;
+}
+
+static int cmd_versions(int argc, char **argv) {
+    if (argc < 2) { fprintf(stderr, "Usage: gecko versions <vault> <name>\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 2) { fprintf(stderr, "Usage: gecko versions <vault> <name>\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (secure_read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    gecko_file_version_t *versions = NULL;
+    uint32_t count = 0;
+    
+    e = gecko_vault_list_versions(v, argv[1], &versions, &count);
+    if (e != GECKO_OK) { 
+        gecko_vault_close(v);
+        fprintf(stderr, "Error: failed to list versions\n"); 
+        return 1; 
+    }
+    
+    if (count == 0) {
+        printf("No versions found for '%s'\n", argv[1]);
+    } else {
+        printf("Versions for '%s':\n", argv[1]);
+        for (uint32_t i = 0; i < count; i++) {
+            char time_str[64];
+            time_t timestamp = (time_t)versions[i].timestamp;
+            strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", 
+                    localtime(&timestamp));
+            printf("  v%d: %s (%zu bytes)\n", 
+                   (int)(count - i), time_str, versions[i].size);
+        }
+    }
+    
+    free(versions);
+    gecko_vault_close(v);
+    return 0;
+}
+
+static int cmd_restore(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "Usage: gecko restore <vault> <name> <version> [dest]\n"); return 1; }
+    
+    int new_argc;
+    const char *keyfile = find_keyfile_arg(argc, argv, &new_argc);
+    if (new_argc < 3) { fprintf(stderr, "Usage: gecko restore <vault> <name> <version> [dest]\n"); return 1; }
+    
+    char pw[MAX_PW];
+    if (secure_read_pw("Password: ", pw, sizeof(pw)) < 0) return 1;
+    
+    gecko_vault_t *v = NULL;
+    gecko_error_t e;
+    if (keyfile) {
+        e = gecko_vault_open_with_keyfile(argv[0], pw, keyfile, &v);
+    } else {
+        e = gecko_vault_open(argv[0], pw, &v);
+    }
+    gecko_secure_zero(pw, sizeof(pw));
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to open vault\n"); return 1; }
+    
+    int version = atoi(argv[2]);
+    if (version <= 0) {
+        fprintf(stderr, "Error: version must be a positive integer\n");
+        gecko_vault_close(v);
+        return 1;
+    }
+    
+    const char *dest_path = (new_argc > 3) ? argv[3] : argv[1];  // Default to same name as vault entry
+    
+    e = gecko_vault_restore_version(v, argv[1], version, dest_path);
+    gecko_vault_close(v);
+    if (e != GECKO_OK) { fprintf(stderr, "Error: failed to restore version\n"); return 1; }
+    
+    printf("Restored version %d of '%s' to '%s'\n", version, argv[1], dest_path);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) { usage(); return 1; }
+    if (argc > MAX_ARGS) { fprintf(stderr, "Error: too many arguments\n"); return 1; }
     
     const char *cmd = argv[1];
     int cargc = argc - 2;
@@ -1171,6 +1328,9 @@ int main(int argc, char **argv) {
     if (!strcmp(cmd, "unhide"))     return cmd_unhide(cargc, cargv);
     if (!strcmp(cmd, "drives"))     return cmd_drives();
     if (!strcmp(cmd, "eject"))      return cmd_eject(cargc, cargv);
+    if (!strcmp(cmd, "add-expire")) return cmd_add_expire(cargc, cargv);
+    if (!strcmp(cmd, "versions"))   return cmd_versions(cargc, cargv);
+    if (!strcmp(cmd, "restore"))    return cmd_restore(cargc, cargv);
     if (!strcmp(cmd, "help") || !strcmp(cmd, "-h")) { usage(); return 0; }
     
     fprintf(stderr, "Unknown command: %s\n", cmd);

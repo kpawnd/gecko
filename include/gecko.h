@@ -44,6 +44,7 @@ typedef enum {
     GECKO_ERR_PERMISSION = -13,
     GECKO_ERR_NOT_INITIALIZED = -14,
     GECKO_ERR_OVERFLOW = -15,
+    GECKO_ERR_NOT_IMPLEMENTED = -16,
 } gecko_error_t;
 
 /* Constants */

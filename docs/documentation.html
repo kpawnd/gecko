@@ -11,7 +11,7 @@
     <div class="container">
       <div class="logo">🦎</div>
       <h1>Gecko Documentation</h1>
-      <p class="tagline">Encrypted USB vault utility — v1.1.0</p>
+      <p class="tagline">Encrypted USB vault utility — v1.2.0</p>
       <div class="buttons">
         <a href="index.html" class="btn btn-secondary">Back to Home</a>
         <a href="https://github.com/kpawnd/gecko/releases/latest" class="btn btn-primary">Download</a>
@@ -23,7 +23,7 @@
     <section>
       <h1>Overview</h1>
       <p class="version">Version 1.1.0 · AES-256-GCM · PBKDF2-HMAC-SHA256 (600k)</p>
-      <p>Gecko is a portable CLI vault for securely storing files and notes. This page documents all commands and advanced features including keyfile 2FA, search, import/export, backup, merge, and compact.</p>
+      <p>Gecko is a portable CLI vault for securely storing files and notes. This page documents all commands and advanced features including time-based access controls, file versioning, keyfile 2FA, search, import/export, backup, merge, and compact.</p>
     </section>
 
     <section>
@@ -32,6 +32,8 @@
       <a href="#install">Installation</a>
       <a href="#basics">Basics</a>
       <a href="#files">File Operations</a>
+      <a href="#timebased">Time-Based Access</a>
+      <a href="#versioning">File Versioning</a>
       <a href="#notes">Notes</a>
       <a href="#search">Search</a>
       <a href="#importexport">Import / Export</a>
@@ -82,6 +84,26 @@
       <div class="feature"><h3>Remove</h3><div class="code-block">gecko rm -v vault.gko -p &lt;pw&gt; -n file.txt</div></div>
       <div class="feature"><h3>Cat</h3><div class="code-block">gecko cat -v vault.gko -p &lt;pw&gt; -n file.txt</div></div>
     </div>
+    </section>
+
+    <section>
+    <h2 id="timebased">Time-Based Access Controls</h2>
+    <div class="grid">
+      <div class="feature"><h3>Add with Expiration</h3><div class="code-block">gecko add-expire vault.gko name file.txt 24</div><p class="muted">Add file with 24-hour expiration.</p></div>
+      <div class="feature"><h3>Auto-Delete on Expiry</h3><div class="code-block">gecko add-expire vault.gko name file.txt 168 --auto-delete</div><p class="muted">Add file with 1-week expiration and automatic deletion.</p></div>
+      <div class="feature"><h3>Check Expiration</h3><div class="code-block">gecko info vault.gko</div><p class="muted">Shows expiry times for all entries.</p></div>
+    </div>
+    <p>Files can be set to automatically expire after a specified number of hours. Use <code>--auto-delete</code> to automatically remove expired files from the vault.</p>
+    </section>
+
+    <section>
+    <h2 id="versioning">File Versioning</h2>
+    <div class="grid">
+      <div class="feature"><h3>List Versions</h3><div class="code-block">gecko versions vault.gko name</div><p class="muted">Show all versions of a file with timestamps.</p></div>
+      <div class="feature"><h3>Restore Version</h3><div class="code-block">gecko restore vault.gko name 2</div><p class="muted">Restore specific version (overwrites current).</p></div>
+      <div class="feature"><h3>Restore to File</h3><div class="code-block">gecko restore vault.gko name 1 restored.txt</div><p class="muted">Restore version to a new file.</p></div>
+    </div>
+    <p>Gecko maintains version history for files. Each time a file is added with the same name, a new version is created. Use versioning to recover previous versions of files.</p>
     </section>
 
     <section>

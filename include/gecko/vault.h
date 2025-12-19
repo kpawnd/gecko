@@ -15,7 +15,41 @@ typedef struct gecko_vault_entry {
     uint64_t encrypted_size;             /* Encrypted size */
     uint64_t offset;                     /* Offset in vault data section */
     uint8_t  hash[GECKO_HASH_SIZE];      /* SHA-256 hash for lookup */
+    uint64_t created_time;               /* Creation timestamp (Unix epoch) */
+    uint64_t expire_time;                /* Expiration timestamp (0 = never) */
+    uint32_t flags;                      /* Entry flags (bitfield) */
 } gecko_vault_entry_t;
+
+/* Versioning structures */
+typedef struct gecko_file_version {
+    uint32_t version_id;                 /* Version number (1, 2, 3...) */
+    uint64_t timestamp;                  /* When this version was created */
+    uint64_t size;                       /* Original file size */
+    uint64_t encrypted_size;             /* Encrypted size */
+    uint64_t offset;                     /* Offset in vault data section */
+    uint8_t  hash[GECKO_HASH_SIZE];      /* SHA-256 hash */
+    char     comment[128];               /* Optional version comment */
+} gecko_file_version_t;
+
+typedef struct gecko_versioned_entry {
+    char name[GECKO_MAX_FILENAME];       /* Base filename */
+    uint32_t current_version;            /* Latest version number */
+    uint32_t version_count;              /* Total versions stored */
+    gecko_file_version_t *versions;      /* Array of versions (max 10) */
+    uint64_t expire_time;                /* Expiration timestamp */
+    uint32_t flags;                      /* Entry flags */
+} gecko_versioned_entry_t;
+
+/* Progress callback for long operations */
+typedef void (*gecko_progress_fn)(uint64_t current, uint64_t total, void *user_data);
+
+/* Entry flags */
+#define GECKO_ENTRY_FLAG_EXPIRED     (1 << 0)  /* Entry has expired */
+#define GECKO_ENTRY_FLAG_AUTO_DELETE (1 << 1)  /* Auto-delete when expired */
+
+/* Versioned entry flags */
+#define GECKO_VERSIONED_FLAG_EXPIRED     (1 << 0)
+#define GECKO_VERSIONED_FLAG_AUTO_DELETE (1 << 1)
 
 /* Forward declaration - vault is opaque */
 typedef struct gecko_vault gecko_vault_t;
@@ -164,6 +198,69 @@ gecko_error_t gecko_vault_enable_audit(gecko_vault_t *vault,
 gecko_error_t gecko_vault_audit_log(gecko_vault_t *vault,
                                      const char *action,
                                      const char *details);
+
+/* Time-based access control functions */
+gecko_error_t gecko_vault_add_with_expiry(gecko_vault_t *vault,
+                                           const char *filepath,
+                                           const char *vault_name,
+                                           uint64_t expire_time,
+                                           bool auto_delete);
+
+gecko_error_t gecko_vault_set_expiry(gecko_vault_t *vault,
+                                      const char *name,
+                                      uint64_t expire_time,
+                                      bool auto_delete);
+
+gecko_error_t gecko_vault_get_expiry(gecko_vault_t *vault,
+                                      const char *name,
+                                      uint64_t *expire_time,
+                                      bool *auto_delete);
+
+gecko_error_t gecko_vault_cleanup_expired(gecko_vault_t *vault);
+
+/* File versioning functions */
+gecko_error_t gecko_vault_add_versioned(gecko_vault_t *vault,
+                                         const char *filepath,
+                                         const char *vault_name,
+                                         const char *comment);
+
+gecko_error_t gecko_vault_list_versions(gecko_vault_t *vault,
+                                         const char *name,
+                                         gecko_file_version_t **versions,
+                                         uint32_t *count);
+
+gecko_error_t gecko_vault_restore_version(gecko_vault_t *vault,
+                                           const char *name,
+                                           uint32_t version_id,
+                                           const char *dest_path);
+
+gecko_error_t gecko_vault_delete_version(gecko_vault_t *vault,
+                                          const char *name,
+                                          uint32_t version_id);
+
+/* Progress-aware operations */
+gecko_error_t gecko_vault_add_with_progress(gecko_vault_t *vault,
+                                             const char *filepath,
+                                             const char *vault_name,
+                                             gecko_progress_fn progress_callback,
+                                             void *user_data);
+
+gecko_error_t gecko_vault_extract_with_progress(gecko_vault_t *vault,
+                                                 const char *name,
+                                                 const char *dest_path,
+                                                 gecko_progress_fn progress_callback,
+                                                 void *user_data);
+
+gecko_error_t gecko_vault_export_with_progress(gecko_vault_t *vault,
+                                                const char *dest_dir,
+                                                gecko_progress_fn progress_callback,
+                                                void *user_data);
+
+gecko_error_t gecko_vault_import_with_progress(gecko_vault_t *vault,
+                                                const char *src_dir,
+                                                const char *prefix,
+                                                gecko_progress_fn progress_callback,
+                                                void *user_data);
 
 #ifdef __cplusplus
 }
